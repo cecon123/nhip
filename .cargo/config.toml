@@ -1,0 +1,7 @@
+# Fast linking with bundled rust-lld on Windows MSVC
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+rustflags = ["-C", "linker-flavor=lld-link"]
+
+[alias]
+nt = "nextest run --workspace"

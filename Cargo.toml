@@ -1,0 +1,72 @@
+[workspace]
+members = [".", "crates/nhip-core"]
+resolver = "2"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "blocking"] }
+serde_json = "1"
+
+[package]
+name = "nhip"
+version = "0.1.0"
+edition = "2021"
+description = "A desktop music player written in Rust"
+
+[[bin]]
+name = "nhip"
+path = "src/main.rs"
+
+[dependencies]
+nhip-core = { path = "crates/nhip-core" }
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow"] }
+lofty = "0.25"
+image = { workspace = true }
+serde_json = { workspace = true }
+rfd = "0.18"
+raw-window-handle = "0.6"
+chrono = { workspace = true }
+reqwest = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wayland", "x11"] }
+
+[target.'cfg(windows)'.dependencies]
+souvlaki = "0.9"
+
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = 0
+
+# Keep core audio/DSP/image/UI crates smooth in dev builds
+[profile.dev.package.nhip-core]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package.symphonia]
+opt-level = 3
+
+[profile.dev.package.timestretch]
+opt-level = 3
+
+[profile.dev.package.cpal]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.egui]
+opt-level = 2
+
+[profile.dev.package.eframe]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

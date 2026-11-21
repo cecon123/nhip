@@ -1,0 +1,22 @@
+[package]
+name = "nhip-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core audio, library, lyrics, and YouTube Music engine for Nhip"
+
+[dependencies]
+cpal = "0.18"
+rtrb = "0.4"
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "aac", "alac", "pcm", "vorbis", "isomp4", "ogg", "wav", "aiff", "caf"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+dirs = "7"
+rand = "0.9"
+chrono = { workspace = true }
+percent-encoding = "2.3.2"
+roxmltree = "0.21.1"
+timestretch = { version = "=0.16.0", default-features = false, features = ["analysis"] }
+ytmapi-rs = { version = "=0.3.4", default-features = false, features = ["native-tls", "simplified-queries", "reqwest"] }
+reqwest = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
