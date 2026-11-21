@@ -111,6 +111,7 @@ impl Shared {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum CancelSignal {
     Flag(Arc<AtomicBool>),
     Epoch { current: Arc<AtomicU64>, expected: u64 },
@@ -366,7 +367,8 @@ struct Worker<F: Fn()> {
     silent: bool,
     output: Output,
     flush_waiting_since: Option<Instant>,
-    output_stalled_since: Option<Instant>,
+    last_consumed: u64,
+    last_consumed_at: Instant,
     last_device_retry: Instant,
     settings: AudioSettings,
     eq: Equalizer,
@@ -417,7 +419,8 @@ impl<F: Fn()> Worker<F> {
             silent,
             output,
             flush_waiting_since: None,
-            output_stalled_since: None,
+            last_consumed: 0,
+            last_consumed_at: Instant::now(),
             last_device_retry: Instant::now(),
             settings,
             eq,
@@ -461,13 +464,15 @@ impl<F: Fn()> Worker<F> {
             Output::create(self.shared.clone())
         };
         self.flush_waiting_since = None;
-        self.output_stalled_since = None;
+        self.last_consumed = self.output.consumed_frames();
+        self.last_consumed_at = Instant::now();
         self.last_device_retry = Instant::now();
         self.reconfigure_eq();
         self.limiter.set_rate(self.output.rate as f32);
     }
 
-    /// Detects and recovers from Windows WASAPI device switches, stalled audio callbacks,
+    /// Detects and recovers from Windows WASAPI device switches, dead audio callbacks
+    /// (measured strictly via `consumed_frames` progress so healthy buffers never false-trigger),
     /// or silent timer fallback when a hardware output device becomes available again.
     fn check_output_health(&mut self) {
         if self.output.failed() {
@@ -477,9 +482,14 @@ impl<F: Fn()> Worker<F> {
         if self.silent {
             return;
         }
+        let consumed = self.output.consumed_frames();
+        if consumed != self.last_consumed {
+            self.last_consumed = consumed;
+            self.last_consumed_at = Instant::now();
+        }
         if self.shared.waiting_for_flush() {
             let since = *self.flush_waiting_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_millis(250) {
+            if since.elapsed() >= Duration::from_millis(1000) {
                 self.rebuild_output();
                 return;
             }
@@ -490,15 +500,14 @@ impl<F: Fn()> Worker<F> {
         if self.current.is_some()
             && !self.shared.is_paused()
             && !self.shared.waiting_for_flush()
-            && self.output.free_frames() < BLOCK_FRAMES
+            && self.output.buffered_frames() >= BLOCK_FRAMES
         {
-            let since = *self.output_stalled_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_millis(600) {
+            if self.last_consumed_at.elapsed() >= Duration::from_millis(1500) {
                 self.rebuild_output();
                 return;
             }
         } else {
-            self.output_stalled_since = None;
+            self.last_consumed_at = Instant::now();
         }
 
         if self.output.is_timer()
@@ -509,7 +518,8 @@ impl<F: Fn()> Worker<F> {
             if let Some(dev) = Output::try_device(self.shared.clone()) {
                 self.output = dev;
                 self.flush_waiting_since = None;
-                self.output_stalled_since = None;
+                self.last_consumed = self.output.consumed_frames();
+                self.last_consumed_at = Instant::now();
                 self.reconfigure_eq();
                 self.limiter.set_rate(self.output.rate as f32);
             }
@@ -590,6 +600,11 @@ impl<F: Fn()> Worker<F> {
             if let Some(cmd) = cmd {
                 if !self.handle(cmd) {
                     return;
+                }
+                self.last_consumed = self.output.consumed_frames();
+                self.last_consumed_at = Instant::now();
+                if self.flush_waiting_since.is_some() {
+                    self.flush_waiting_since = Some(Instant::now());
                 }
                 continue;
             }
@@ -1214,6 +1229,9 @@ mod tests {
 mod http_range {
     use std::collections::VecDeque;
     use std::io::{self, Read, Seek, SeekFrom};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use symphonia::core::io::MediaSource;
@@ -1222,7 +1240,7 @@ mod http_range {
     use crate::ytm::{google_media_url, stream_http_agent, ResolvedStream};
 
     pub(super) const CHUNK_SIZE: usize = 256 * 1024;
-    const MAX_CACHED_CHUNKS: usize = 8;
+    const MAX_CACHED_CHUNKS: usize = 16;
     const READ_SLICE: usize = 32 * 1024;
 
     enum RangeErr {
@@ -1249,11 +1267,20 @@ mod http_range {
         stream: ResolvedStream,
         resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
         enforce_google_url: bool,
+        enable_prefetch: bool,
         refreshes: u8,
         total_len: u64,
         pos: u64,
         cache: VecDeque<(u64, Vec<u8>)>,
         cancel: CancelSignal,
+        prefetch_stop: Arc<AtomicBool>,
+        prefetch: Option<(u64, Mutex<Receiver<Result<Vec<u8>, RangeErr>>>)>,
+    }
+
+    impl Drop for HttpRangeSource {
+        fn drop(&mut self) {
+            self.prefetch_stop.store(true, Ordering::Release);
+        }
     }
 
     impl HttpRangeSource {
@@ -1277,6 +1304,7 @@ mod http_range {
                     }
                 }),
                 true,
+                true,
                 initial_fresh,
                 cancel,
             )
@@ -1288,7 +1316,7 @@ mod http_range {
             mut resolver: Box<dyn FnMut() -> Result<ResolvedStream, String> + Send + Sync>,
             cancel: CancelSignal,
         ) -> io::Result<Self> {
-            Self::open_inner(agent, Box::new(move |_fresh| resolver()), false, false, cancel)
+            Self::open_inner(agent, Box::new(move |_fresh| resolver()), false, false, false, cancel)
         }
 
         #[cfg(test)]
@@ -1297,13 +1325,23 @@ mod http_range {
             resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
             cancel: CancelSignal,
         ) -> io::Result<Self> {
-            Self::open_inner(agent, resolver, false, false, cancel)
+            Self::open_inner(agent, resolver, false, false, false, cancel)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn open_with_prefetch_resolver(
+            agent: reqwest::blocking::Client,
+            resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
+            cancel: CancelSignal,
+        ) -> io::Result<Self> {
+            Self::open_inner(agent, resolver, false, true, false, cancel)
         }
 
         fn open_inner(
             agent: reqwest::blocking::Client,
             mut resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
             enforce_google_url: bool,
+            enable_prefetch: bool,
             initial_fresh: bool,
             cancel: CancelSignal,
         ) -> io::Result<Self> {
@@ -1347,17 +1385,22 @@ mod http_range {
             let mut cache = VecDeque::with_capacity(MAX_CACHED_CHUNKS);
             cache.push_back((0, first_chunk));
 
-            Ok(Self {
+            let mut src = Self {
                 agent,
                 stream,
                 resolver,
                 enforce_google_url,
+                enable_prefetch,
                 refreshes,
                 total_len: total,
                 pos: 0,
                 cache,
                 cancel,
-            })
+                prefetch_stop: Arc::new(AtomicBool::new(false)),
+                prefetch: None,
+            };
+            src.schedule_prefetch(1);
+            Ok(src)
         }
 
         fn fetch_full_range(
@@ -1482,6 +1525,53 @@ mod http_range {
             Ok((cr_end, cr_total, body))
         }
 
+        fn schedule_prefetch(&mut self, chunk_idx: u64) {
+            if !self.enable_prefetch || self.cancel.is_cancelled() || self.prefetch_stop.load(Ordering::Acquire) {
+                return;
+            }
+            let start = chunk_idx.saturating_mul(CHUNK_SIZE as u64);
+            if start >= self.total_len {
+                return;
+            }
+            if self.cache.iter().any(|(idx, _)| *idx == chunk_idx) {
+                return;
+            }
+            if self.prefetch.as_ref().is_some_and(|(idx, _)| *idx == chunk_idx) {
+                return;
+            }
+            let end = (start + CHUNK_SIZE as u64 - 1).min(self.total_len - 1);
+            let agent = self.agent.clone();
+            let stream = self.stream.clone();
+            let total_len = self.total_len;
+            let cancel = self.cancel.clone();
+            let stop = self.prefetch_stop.clone();
+            let (tx, rx) = mpsc::channel();
+            if std::thread::Builder::new()
+                .name("ytm-readahead".into())
+                .spawn(move || {
+                    if stop.load(Ordering::Acquire) || cancel.is_cancelled() {
+                        return;
+                    }
+                    let res = Self::fetch_full_range(&agent, &stream, start, end, Some(total_len), &cancel)
+                        .map(|(_, data)| data);
+                    let _ = tx.send(res);
+                })
+                .is_ok()
+            {
+                self.prefetch = Some((chunk_idx, Mutex::new(rx)));
+            }
+        }
+
+        fn insert_cached_chunk(&mut self, chunk_idx: u64, data: Vec<u8>) {
+            if let Some(pos) = self.cache.iter().position(|(idx, _)| *idx == chunk_idx) {
+                self.cache.remove(pos);
+            }
+            if self.cache.len() >= MAX_CACHED_CHUNKS {
+                self.cache.pop_front();
+            }
+            self.cache.push_back((chunk_idx, data));
+        }
+
         fn refresh_stream(&mut self) -> io::Result<()> {
             if self.cancel.is_cancelled() {
                 return Err(RangeErr::Cancelled.into_io());
@@ -1490,6 +1580,7 @@ mod http_range {
                 return Err(io::Error::other("stream refresh limit reached"));
             }
             self.refreshes += 1;
+            self.prefetch = None;
             let next = (self.resolver)(true).map_err(io::Error::other)?;
             if self.enforce_google_url && google_media_url(&next.url).is_none() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "untrusted stream host"));
@@ -1499,9 +1590,28 @@ mod http_range {
         }
 
         fn get_or_fetch_chunk(&mut self, chunk_idx: u64) -> io::Result<&[u8]> {
+            // Drain any finished read-ahead chunk into cache even if it's for a neighbor index.
+            if let Some((pref_idx, rx_mtx)) = self.prefetch.take() {
+                if pref_idx == chunk_idx {
+                    if let Ok(Ok(data)) = rx_mtx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+                        self.insert_cached_chunk(chunk_idx, data);
+                        self.schedule_prefetch(chunk_idx + 1);
+                        return Ok(&self.cache.back().expect("just pushed").1);
+                    }
+                } else {
+                    let poll = rx_mtx.lock().unwrap_or_else(|e| e.into_inner()).try_recv();
+                    match poll {
+                        Ok(Ok(data)) => self.insert_cached_chunk(pref_idx, data),
+                        Err(mpsc::TryRecvError::Empty) => self.prefetch = Some((pref_idx, rx_mtx)),
+                        _ => {}
+                    }
+                }
+            }
+
             if let Some(pos) = self.cache.iter().position(|(idx, _)| *idx == chunk_idx) {
                 let entry = self.cache.remove(pos).expect("valid cache index");
                 self.cache.push_back(entry);
+                self.schedule_prefetch(chunk_idx + 1);
                 return Ok(&self.cache.back().expect("just pushed").1);
             }
 
@@ -1543,10 +1653,8 @@ mod http_range {
                 }
             };
 
-            if self.cache.len() >= MAX_CACHED_CHUNKS {
-                self.cache.pop_front();
-            }
-            self.cache.push_back((chunk_idx, data));
+            self.insert_cached_chunk(chunk_idx, data);
+            self.schedule_prefetch(chunk_idx + 1);
             Ok(&self.cache.back().expect("just pushed").1)
         }
     }
@@ -1952,6 +2060,69 @@ mod http_range {
             }
             let pos = engine.position_ms();
             assert!((13_500..=14_500).contains(&pos), "expected settled seek near 14000ms, got {pos}ms");
+        }
+
+        #[test]
+        fn http_range_prefetches_next_chunk_in_background() {
+            let payload: Arc<Vec<u8>> = Arc::new((0..(CHUNK_SIZE * 2 + 64)).map(|i| (i % 251) as u8).collect());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let hits = Arc::new(AtomicUsize::new(0));
+
+            let srv_data = payload.clone();
+            let srv_stop = stop.clone();
+            let srv_hits = hits.clone();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                while !srv_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut conn, _)) => {
+                            let _ = conn.set_nonblocking(false);
+                            if let Some((_path, Some((s, e)))) = parse_http_request(&mut conn) {
+                                srv_hits.fetch_add(1, Ordering::Relaxed);
+                                send_206(&mut conn, &srv_data, s, e);
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let url = format!("http://{addr}/audio");
+            let mut src = HttpRangeSource::open_with_prefetch_resolver(
+                test_agent(),
+                Box::new(move |_| {
+                    Ok(ResolvedStream {
+                        itag: Some(140),
+                        url: url.clone(),
+                        headers: vec![],
+                        content_length: None,
+                        expires_at: None,
+                    })
+                }),
+                CancelSignal::Flag(Arc::new(AtomicBool::new(false))),
+            )
+            .unwrap();
+
+            // Background read-ahead should fetch chunk 1 automatically right after chunk 0 opens.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while hits.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(hits.load(Ordering::Relaxed) >= 2, "expected background read-ahead of chunk 1");
+
+            // Reading chunk 1 consumes the prefetched data and validates exact bytes.
+            src.seek(SeekFrom::Start(CHUNK_SIZE as u64)).unwrap();
+            let mut buf = [0u8; 16];
+            src.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, &payload[CHUNK_SIZE..CHUNK_SIZE + 16]);
+
+            stop.store(true, Ordering::Relaxed);
+            let _ = server.join();
         }
 
         #[test]

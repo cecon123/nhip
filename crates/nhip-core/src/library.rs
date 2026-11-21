@@ -395,6 +395,17 @@ pub struct TableSort {
     pub ascending: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurfaceStyle {
+    /// Classic crisp dark Spotify chrome (`#000000` / `#121212`).
+    #[default]
+    Standard,
+    /// Soft live blurred album-art backdrop bleeding gently behind frosted translucent panels.
+    AmbientBlur,
+    /// Frosted Acrylic glass aesthetic with subtle cool specular border and deep tinted translucency.
+    Acrylic,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -427,6 +438,7 @@ pub struct Settings {
     pub autoplay: bool,
     pub miniplayer_size: Option<[f32; 2]>,
     pub miniplayer_cover_mode: bool,
+    pub surface_style: SurfaceStyle,
 }
 
 impl Default for Settings {
@@ -461,6 +473,7 @@ impl Default for Settings {
             autoplay: true,
             miniplayer_size: None,
             miniplayer_cover_mode: false,
+            surface_style: SurfaceStyle::Standard,
         }
     }
 }
@@ -580,10 +593,30 @@ fn default_pinned_items() -> Vec<RecentItem> {
     vec![RecentItem::Liked]
 }
 
+fn deserialize_folders<'de, D>(deserializer: D) -> Result<Vec<PlaylistFolder>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    let mut out = Vec::new();
+    for item in items {
+        // Legacy versions stored local music directory paths (`Vec<String>`) in `"folders"`;
+        // ignore those strings gracefully so `user.json` upgrades without blocking saves.
+        if item.is_string() {
+            continue;
+        }
+        if let Ok(folder) = serde_json::from_value::<PlaylistFolder>(item) {
+            out.push(folder);
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UserData {
     pub playlists: Vec<Playlist>,
+    #[serde(default, deserialize_with = "deserialize_folders")]
     pub folders: Vec<PlaylistFolder>,
     pub followed_ytm: Vec<crate::ytm::FollowedPlaylist>,
     pub followed_artists: std::collections::HashSet<String>,
@@ -1308,5 +1341,21 @@ mod tests {
         data.record_fast_skip(skipped_id);
         let skipped = data.score_recommendation(&lib, skipped_id, "Unknown Artist");
         assert!(skipped < unknown, "fast-skipped track should be demoted ({skipped} vs {unknown})");
+    }
+
+    #[test]
+    fn legacy_user_json_with_string_folders_migrates_without_failing() {
+        let legacy = r#"{
+            "folders": ["C:\\Users\\demo\\Music"],
+            "playlists": [],
+            "liked": [],
+            "recent_searches": ["thắng"],
+            "settings": { "lang": "Vi", "volume": 0.42, "spotify_client_id": "" }
+        }"#;
+        let parsed: UserData = serde_json::from_str(legacy).expect("legacy user.json must deserialize");
+        assert!(parsed.folders.is_empty());
+        assert_eq!(parsed.recent_searches, vec!["thắng"]);
+        assert!((parsed.settings.volume - 0.42).abs() < 1e-4);
+        assert_eq!(parsed.settings.surface_style, SurfaceStyle::Standard);
     }
 }

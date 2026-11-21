@@ -19,7 +19,7 @@ use eframe::egui::{
 };
 
 use crate::app::{Action, App, RightTab, Route, TopPopover};
-use crate::library::{fold, RecentItem};
+use crate::library::{fold, RecentItem, SurfaceStyle};
 use crate::queue::Repeat;
 use crate::theme::*;
 use icons::Icon;
@@ -29,7 +29,8 @@ use widgets::*;
 
 pub fn draw(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
-    ui.painter().rect_filled(full, 0.0, BG);
+    let surface = app.data.settings.surface_style;
+    draw_window_surface(app, ui, full, surface);
 
     let top = Rect::from_min_size(full.min, Vec2::new(full.width(), TOP_BAR));
     let bar = Rect::from_min_max(Pos2::new(full.left(), full.bottom() - PLAYER_BAR), full.max);
@@ -123,10 +124,10 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
 
     let saved_collapsed = app.data.settings.left_collapsed;
     app.data.settings.left_collapsed = effective_collapsed;
-    panel(ui, left, "library", |ui| sidebar::draw(app, ui));
+    panel(ui, left, "library", surface, |ui| sidebar::draw(app, ui));
     app.data.settings.left_collapsed = saved_collapsed;
 
-    panel(ui, main, "main", |ui| pages::draw(app, ui));
+    panel(ui, main, "main", surface, |ui| pages::draw(app, ui));
 
     if right_w > 0.0 {
         let right = Rect::from_min_max(Pos2::new(body.right() - right_w, body.top()), body.max);
@@ -154,12 +155,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
                         color: Color32::from_black_alpha(190),
                     };
                     ui.painter().add(shadow.as_shape(right, card_radius(RADIUS)));
-                    panel(ui, right, "right-overlay", |ui| right_panel::draw(app, ui));
+                    panel(ui, right, "right-overlay", surface, |ui| right_panel::draw(app, ui));
                     let edge = Rect::from_min_max(Pos2::new(right.left() - GAP, right.top()), Pos2::new(right.left(), right.bottom()));
                     resize_right(app, ui, edge, body.width() - left_w - GAP * 2.0);
                 });
         } else {
-            panel(ui, right, "right", |ui| right_panel::draw(app, ui));
+            panel(ui, right, "right", surface, |ui| right_panel::draw(app, ui));
             resize_right(
                 app,
                 ui,
@@ -513,31 +514,85 @@ fn window_buttons(ui: &mut Ui, top: Rect) -> f32 {
     W * 3.0
 }
 
-fn panel(ui: &mut Ui, rect: Rect, id: &str, add: impl FnOnce(&mut Ui)) {
-    ui.painter().rect_filled(rect, RADIUS, PANEL);
+fn draw_window_surface(app: &mut App, ui: &mut Ui, full: Rect, surface: SurfaceStyle) {
+    if surface == SurfaceStyle::Standard {
+        ui.painter().rect_filled(full, 0.0, BG);
+        return;
+    }
+
+    // Soft ambient blurred artwork or deep frosted slate wash behind translucent glass panels.
+    ui.painter().rect_filled(full, 0.0, Color32::from_rgb(0x07, 0x09, 0x0c));
+    let cover_tex = app.current_track().map(|t| {
+        let key = t.cover_key();
+        app.art.backdrop_texture(ui.ctx(), &key, t.art_source())
+    });
+    if let Some(tex) = cover_tex {
+        let uv = Rect::from_min_max(Pos2::new(0.08, 0.08), Pos2::new(0.92, 0.92));
+        let tint = match surface {
+            SurfaceStyle::AmbientBlur => Color32::from_rgba_unmultiplied(230, 235, 245, 138),
+            SurfaceStyle::Acrylic => Color32::from_rgba_unmultiplied(195, 212, 232, 92),
+            SurfaceStyle::Standard => Color32::TRANSPARENT,
+        };
+        ui.painter().image(tex.id(), full, uv, tint);
+    } else {
+        // Rich subtle emerald-indigo atmospheric bloom when idle.
+        let glow_l = Pos2::new(full.left() + full.width() * 0.22, full.top() + full.height() * 0.24);
+        let glow_r = Pos2::new(full.left() + full.width() * 0.78, full.top() + full.height() * 0.72);
+        ui.painter().circle_filled(glow_l, full.width() * 0.42, Color32::from_rgba_unmultiplied(24, 118, 72, 42));
+        ui.painter().circle_filled(glow_r, full.width() * 0.45, Color32::from_rgba_unmultiplied(36, 78, 138, 44));
+    }
+
+    if surface == SurfaceStyle::Acrylic {
+        // Frosted Acrylic dark tint + cool top specular veil.
+        ui.painter().rect_filled(full, 0.0, Color32::from_rgba_unmultiplied(12, 16, 22, 152));
+        let top_sheen = Rect::from_min_size(full.min, Vec2::new(full.width(), TOP_BAR));
+        ui.painter().rect_filled(top_sheen, 0.0, Color32::from_white_alpha(8));
+    } else {
+        ui.painter().rect_filled(full, 0.0, Color32::from_rgba_unmultiplied(8, 10, 14, 118));
+    }
+}
+
+fn panel(ui: &mut Ui, rect: Rect, id: &str, surface: SurfaceStyle, add: impl FnOnce(&mut Ui)) {
+    let (fill, rim) = match surface {
+        SurfaceStyle::Standard => (PANEL, None),
+        SurfaceStyle::AmbientBlur => (
+            Color32::from_rgba_unmultiplied(16, 17, 21, 188),
+            Some(Color32::from_white_alpha(22)),
+        ),
+        SurfaceStyle::Acrylic => (
+            Color32::from_rgba_unmultiplied(24, 28, 36, 158),
+            Some(Color32::from_white_alpha(38)),
+        ),
+    };
+    ui.painter().rect_filled(rect, RADIUS, fill);
     let mut child = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect).layout(Layout::top_down(Align::Min)));
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     add(&mut child);
-    // egui clips to rectangles; mask artwork/lyrics overflow at the shell's rounded corners.
-    let mut mask = egui::epaint::Mesh::default();
-    let r = RADIUS as f32;
-    for (corner, inward) in [
-        (rect.left_top(), Vec2::new(1.0, 1.0)),
-        (rect.right_top(), Vec2::new(-1.0, 1.0)),
-        (rect.left_bottom(), Vec2::new(1.0, -1.0)),
-        (rect.right_bottom(), Vec2::new(-1.0, -1.0)),
-    ] {
-        let base = mask.vertices.len() as u32;
-        mask.colored_vertex(corner, BG);
-        for i in 0..=12 {
-            let angle = std::f32::consts::FRAC_PI_2 * i as f32 / 12.0;
-            mask.colored_vertex(corner + inward * Vec2::new(r * (1.0 - angle.cos()), r * (1.0 - angle.sin())), BG);
-            if i > 0 {
-                mask.add_triangle(base, base + i, base + i + 1);
+    if surface == SurfaceStyle::Standard {
+        // egui clips to rectangles; mask artwork/lyrics overflow at the shell's rounded corners.
+        let mut mask = egui::epaint::Mesh::default();
+        let r = RADIUS as f32;
+        for (corner, inward) in [
+            (rect.left_top(), Vec2::new(1.0, 1.0)),
+            (rect.right_top(), Vec2::new(-1.0, 1.0)),
+            (rect.left_bottom(), Vec2::new(1.0, -1.0)),
+            (rect.right_bottom(), Vec2::new(-1.0, -1.0)),
+        ] {
+            let base = mask.vertices.len() as u32;
+            mask.colored_vertex(corner, BG);
+            for i in 0..=12 {
+                let angle = std::f32::consts::FRAC_PI_2 * i as f32 / 12.0;
+                mask.colored_vertex(corner + inward * Vec2::new(r * (1.0 - angle.cos()), r * (1.0 - angle.sin())), BG);
+                if i > 0 {
+                    mask.add_triangle(base, base + i, base + i + 1);
+                }
             }
         }
+        ui.painter().add(egui::Shape::mesh(mask));
     }
-    ui.painter().add(egui::Shape::mesh(mask));
+    if let Some(stroke_col) = rim {
+        ui.painter().rect_stroke(rect, RADIUS, Stroke::new(1.0, stroke_col), egui::StrokeKind::Inside);
+    }
 }
 
 fn resize_left(app: &mut App, ui: &mut Ui, gap: Rect, body_left: f32, window_w: f32) {
@@ -800,16 +855,22 @@ fn top_bar(app: &mut App, ui: &mut Ui, top: Rect) {
         8.0
     };
     let edit_rect = Rect::from_min_max(
-        Pos2::new(search_rect.left() + 48.0, cy - 13.0),
-        Pos2::new(div_x - clear_reserve, cy + 13.0),
+        Pos2::new(search_rect.left() + 48.0, search_rect.top()),
+        Pos2::new(div_x - clear_reserve, search_rect.bottom()),
     );
-    let mut edit_ui = ui.new_child(UiBuilder::new().id_salt("search-edit").max_rect(edit_rect));
+    let mut edit_ui = ui.new_child(
+        UiBuilder::new()
+            .id_salt("search-edit")
+            .max_rect(edit_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
     let edit = TextEdit::singleline(&mut app.search)
         .frame(egui::Frame::NONE)
+        .align(Align2::LEFT_CENTER)
         .font(body_medium())
         .hint_text(RichText::new(t_placeholder).color(SUBTLE).font(body_medium()))
         .desired_width(edit_rect.width().max(40.0));
-    let resp = edit_ui.add(edit);
+    let resp = edit_ui.add_sized(Vec2::new(edit_rect.width().max(40.0), 48.0), edit);
 
     if app.focus_search {
         app.focus_search = false;
@@ -883,9 +944,9 @@ fn draw_search_dropdown(app: &mut App, ui: &mut Ui, search_rect: Rect) {
         .show(ui.ctx(), |ui| {
             popup_frame(ui.style()).show(ui, |ui| {
                 ui.set_width(dd_w - 16.0);
-                ui.set_max_height(430.0);
+                ui.set_max_height(460.0);
                 let q = app.search.trim().to_string();
-                if q.is_empty() {
+                if !q.is_empty() {
                     draw_search_dropdown_hints(app, ui);
                 }
                 ScrollArea::vertical().id_salt("search-dd-scroll").auto_shrink([false, true]).show(ui, |ui| {
@@ -950,36 +1011,115 @@ fn paint_dropdown_keycap(ui: &Ui, left_cy: Pos2, label: &str) -> f32 {
 }
 
 fn draw_search_dropdown_empty(app: &mut App, ui: &mut Ui) {
-    if !app.data.recent_searches.is_empty() {
+    let has_queries = !app.data.recent_searches.is_empty();
+    let recent_tracks: Vec<_> = app
+        .data
+        .listening_history
+        .iter()
+        .filter_map(|&id| app.lib.track(id))
+        .take(6)
+        .collect();
+    if has_queries || !recent_tracks.is_empty() {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(app.t("Tìm kiếm gần đây", "Recent searches")).font(title_small()).color(TEXT));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new(app.t("Xóa tất cả", "Clear all")).font(marginal()).color(SUBTLE)).frame(false)).clicked() {
-                    app.actions.push(Action::ClearRecentSearches);
-                }
-            });
+            ui.label(
+                RichText::new(app.t("Các tìm kiếm gần đây", "Recent searches"))
+                    .font(bold(16.0))
+                    .color(TEXT),
+            );
+            if has_queries {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(app.t("Xóa tất cả", "Clear all"))
+                                    .font(marginal())
+                                    .color(SUBTLE),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        app.actions.push(Action::ClearRecentSearches);
+                    }
+                });
+            }
         });
-        ui.add_space(4.0);
-        let recents: Vec<String> = app.data.recent_searches.iter().take(6).cloned().collect();
+        ui.add_space(6.0);
+
+        // Rich recent song/artist rows matching Spotify Desktop (`48x48` covers + `Bài hát • Nghệ sĩ`).
+        for track in recent_tracks {
+            let rw = ui.available_width();
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(rw, 58.0), Sense::click());
+            let hov = ui.rect_contains_pointer(rect);
+            if hov {
+                ui.painter().rect_filled(rect, RADIUS_BASE, Color32::from_white_alpha(18));
+            }
+            let art_r = Rect::from_min_size(rect.min + Vec2::new(4.0, 5.0), Vec2::splat(48.0));
+            let tex = app.art.get(ui.ctx(), &track.cover_key(), track.art_source());
+            cover(ui, art_r, &tex, RADIUS_BASE);
+            if hov {
+                ui.painter().rect_filled(art_r, RADIUS_BASE, Color32::from_black_alpha(135));
+                icons::paint(
+                    ui.painter(),
+                    Rect::from_center_size(art_r.center(), Vec2::splat(16.0)),
+                    Icon::Play,
+                    TEXT,
+                );
+            }
+            let tx = art_r.right() + 12.0;
+            let tw = (rect.right() - tx - 10.0).max(20.0);
+            text(
+                ui.painter(),
+                Pos2::new(tx, rect.top() + 19.0),
+                &track.title,
+                semi(14.5),
+                TEXT,
+                tw,
+                Align2::LEFT_CENTER,
+            );
+            let sub = format!("{} • {}", app.t("Bài hát", "Song"), track.artist);
+            text(
+                ui.painter(),
+                Pos2::new(tx, rect.top() + 39.0),
+                &sub,
+                marginal(),
+                SUBTLE,
+                tw,
+                Align2::LEFT_CENTER,
+            );
+            if resp.clicked() {
+                app.actions.push(Action::SetSearchDropdown(false));
+                app.actions.push(Action::PlayContext {
+                    context: crate::queue::ContextRef::All,
+                    name: track.title.clone(),
+                    tracks: vec![track.id],
+                    start: Some(0),
+                });
+            }
+        }
+
+        let recents: Vec<String> = app.data.recent_searches.iter().take(5).cloned().collect();
         for item in recents {
             let rw = ui.available_width();
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(rw, 38.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(rw, 46.0), Sense::click());
             if ui.rect_contains_pointer(rect) {
                 ui.painter().rect_filled(rect, RADIUS_BASE, Color32::from_white_alpha(18));
             }
+            let badge_c = Pos2::new(rect.left() + 24.0, rect.center().y);
+            ui.painter().circle_filled(badge_c, 18.0, ELEVATED);
             icons::paint(
                 ui.painter(),
-                Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0)),
+                Rect::from_center_size(badge_c, Vec2::splat(16.0)),
                 Icon::Search,
                 SUBTLE,
             );
             text(
                 ui.painter(),
-                Pos2::new(rect.left() + 38.0, rect.center().y),
+                Pos2::new(rect.left() + 52.0, rect.center().y),
                 &item,
-                body_small(),
+                semi(14.0),
                 TEXT,
-                (rw - 72.0).max(20.0),
+                (rw - 86.0).max(20.0),
                 Align2::LEFT_CENTER,
             );
             let rm_r = Rect::from_center_size(Pos2::new(rect.right() - 18.0, rect.center().y), Vec2::splat(22.0));
@@ -995,7 +1135,7 @@ fn draw_search_dropdown_empty(app: &mut App, ui: &mut Ui) {
 
     ui.label(RichText::new(app.t("Thể loại phổ biến", "Browse categories")).font(title_small()).color(TEXT));
     ui.add_space(6.0);
-    let cats = ["V-Pop", "Pop", "Lo-fi", "Jazz", "Acoustic", "Indie", "EDM", "Chill"];
+    let cats = ["Nhạc", "V-Pop", "Indie", "Pop", "Lo-fi", "Jazz", "Rock", "Chill"];
     ui.horizontal_wrapped(|ui| {
         for cat in cats {
             let w = pill_width(ui, cat);
@@ -1027,22 +1167,66 @@ fn draw_search_dropdown_results(app: &mut App, ui: &mut Ui, q: &str) {
     };
     let ytm_pending = debouncing || ytm_poll_pending;
 
-    // In live mode, prioritize real YouTube Music results (Albums, Artists, Songs, Playlists)
-    // instead of hiding them behind 1-song played-history stubs!
+    // Spotify-style top query autocomplete rows (`🔍` in circular badge + bold query suggestions).
+    let mut query_suggestions: Vec<String> = vec![q.to_lowercase()];
+    for item in ytm_items.iter().take(6) {
+        if query_suggestions.len() >= 3 {
+            break;
+        }
+        let cand = if item.by.is_empty() {
+            item.title.to_lowercase()
+        } else {
+            let primary_by = item.by.split(',').next().unwrap_or(&item.by).trim();
+            format!("{} {}", primary_by.to_lowercase(), item.title.to_lowercase())
+        };
+        if !query_suggestions.iter().any(|s| fold(s) == fold(&cand)) {
+            query_suggestions.push(cand);
+        }
+    }
+    for (si, sug) in query_suggestions.into_iter().enumerate() {
+        let rw = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(rw, 48.0), Sense::click());
+        if ui.rect_contains_pointer(rect) {
+            ui.painter().rect_filled(rect, RADIUS_BASE, Color32::from_white_alpha(18));
+        }
+        let badge_c = Pos2::new(rect.left() + 24.0, rect.center().y);
+        ui.painter().circle_filled(badge_c, 19.0, ELEVATED);
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(badge_c, Vec2::splat(17.0)),
+            Icon::Search,
+            SUBTLE,
+        );
+        text(
+            ui.painter(),
+            Pos2::new(rect.left() + 56.0, rect.center().y),
+            &sug,
+            if si == 0 { bold(14.5) } else { semi(14.5) },
+            TEXT,
+            (rw - 68.0).max(20.0),
+            Align2::LEFT_CENTER,
+        );
+        if resp.clicked() {
+            app.actions.push(Action::SelectRecentSearch(sug));
+        }
+    }
+    ui.add_space(4.0);
+
+    // Rich 48x48 instant YouTube Music entity matches with `+`/`✓` Save-to-Liked action button.
     if !ytm_items.is_empty() {
         any = true;
         for item in ytm_items.iter().take(6) {
             let rw = ui.available_width();
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(rw, 52.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(rw, 58.0), Sense::click());
             let row_hovered = ui.rect_contains_pointer(rect);
             if row_hovered {
                 ui.painter().rect_filled(rect, RADIUS_BASE, Color32::from_white_alpha(20));
             }
-            let art_r = Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::splat(40.0));
+            let art_r = Rect::from_min_size(rect.min + Vec2::new(4.0, 5.0), Vec2::splat(48.0));
             let is_artist = matches!(item.id, crate::ytm::ItemId::Artist(_));
             let is_song = matches!(item.id, crate::ytm::ItemId::Song(_));
             let tex = app.art.get(ui.ctx(), &item.cover_key(), item.image.as_deref());
-            cover(ui, art_r, &tex, if is_artist { 20.0 } else { RADIUS_BASE });
+            cover(ui, art_r, &tex, if is_artist { 24.0 } else { RADIUS_BASE });
             if row_hovered && is_song {
                 ui.painter().rect_filled(art_r, RADIUS_BASE, Color32::from_black_alpha(135));
                 icons::paint(
@@ -1052,17 +1236,36 @@ fn draw_search_dropdown_results(app: &mut App, ui: &mut Ui, q: &str) {
                     TEXT,
                 );
             }
-            let tx = art_r.right() + 10.0;
-            let tw = (rect.right() - tx - 12.0).max(20.0);
-            text(ui.painter(), Pos2::new(tx, rect.top() + 17.0), &item.title, semi(14.5), TEXT, tw, Align2::LEFT_CENTER);
+            let liked_song = match &item.id {
+                crate::ytm::ItemId::Song(vid) => app.data.is_liked(crate::library::fnv(&format!("yt:{vid}"))),
+                _ => false,
+            };
+            let right_reserve = if is_song { 42.0 } else { 12.0 };
+            let tx = art_r.right() + 12.0;
+            let tw = (rect.right() - tx - right_reserve).max(20.0);
+            text(ui.painter(), Pos2::new(tx, rect.top() + 19.0), &item.title, semi(14.5), TEXT, tw, Align2::LEFT_CENTER);
             let kind_lbl = pages::ytm_kind_label(app, item, None);
             let sub = if item.by.is_empty() {
                 kind_lbl.to_string()
             } else {
                 format!("{kind_lbl} • {}", item.by)
             };
-            text(ui.painter(), Pos2::new(tx, rect.top() + 35.0), &sub, marginal(), SUBTLE, tw, Align2::LEFT_CENTER);
-            if resp.clicked() {
+            text(ui.painter(), Pos2::new(tx, rect.top() + 39.0), &sub, marginal(), SUBTLE, tw, Align2::LEFT_CENTER);
+
+            let mut sub_clicked = false;
+            if is_song {
+                let save_r = Rect::from_center_size(Pos2::new(rect.right() - 20.0, rect.center().y), Vec2::splat(28.0));
+                let (s_ic, s_col, s_tip) = if liked_song {
+                    (Icon::Saved, ACCENT, app.t("Xóa khỏi Bài hát đã thích", "Remove from Liked Songs"))
+                } else {
+                    (Icon::Save, SUBTLE, app.t("Lưu vào Bài hát đã thích", "Save to Liked Songs"))
+                };
+                if icon_button_sized(ui, save_r, ("dd-ytm-save", &item.title, &item.by), s_ic, s_col, s_tip, 17.0).clicked() {
+                    sub_clicked = true;
+                    app.actions.push(Action::LikeYouTubeSong(item.clone()));
+                }
+            }
+            if resp.clicked() && !sub_clicked {
                 app.actions.push(Action::SetSearchDropdown(false));
                 if is_song {
                     app.actions.push(Action::SelectYouTubeSong(item.clone()));

@@ -705,6 +705,16 @@ const BROWSE_CATEGORIES: &[BrowseCategory] = &[
     BrowseCategory { vi: "Điện tử", en: "Electronic", query: "Electronic", color: Color32::from_rgb(0x0d, 0x73, 0xec) },
 ];
 
+fn find_browse_category(query: &str) -> Option<&'static BrowseCategory> {
+    let fq = fold(query.trim());
+    if fq.is_empty() {
+        return None;
+    }
+    BROWSE_CATEGORIES
+        .iter()
+        .find(|c| fold(c.query) == fq || fold(c.vi) == fq || fold(c.en) == fq)
+}
+
 fn draw_search_page(
     app: &mut App,
     ui: &mut Ui,
@@ -727,6 +737,8 @@ fn draw_search_page(
         return false;
     }
 
+    let matched_category = (!demo_mode).then(|| find_browse_category(&query)).flatten();
+
     // Build unified SearchResults (either Demo local search or Live YTM results).
     let demo_items: Vec<Item> = if demo_mode {
         build_demo_search_items(app, &query)
@@ -741,6 +753,82 @@ fn draw_search_page(
         let inner_w = (w - side * 2.0).max(200.0);
         let scroll_y = vp.min.y.max(0.0);
         let origin = ui.cursor().min;
+
+        if let Some(cat) = matched_category {
+            if browser.filter == SearchFilter::All {
+                let hero_h = if w < 640.0 { 164.0 } else { 208.0 };
+                let wash = Rect::from_min_size(origin, Vec2::new(w, hero_h + 120.0));
+                draw_full_bleed_gradient(ui.painter(), wash, cat.color, PANEL);
+                let (hero_r, _) = ui.allocate_exact_size(Vec2::new(w, hero_h), Sense::hover());
+                let title = app.t(cat.vi, cat.en);
+                let font_sz = if w < 640.0 { 44.0 } else { 68.0 };
+                text(
+                    ui.painter(),
+                    Pos2::new(hero_r.left() + side, hero_r.bottom() - 24.0),
+                    title,
+                    bold(font_sz),
+                    TEXT,
+                    inner_w,
+                    Align2::LEFT_BOTTOM,
+                );
+                ui.add_space(12.0);
+
+                if pending && demo_items.is_empty() {
+                    draw_search_skeleton(ui, side);
+                    return;
+                }
+                if let Some(err) = error {
+                    if draw_error_banner(app, ui, side, err, || {}) {
+                        retry_clicked = true;
+                    }
+                    return;
+                }
+
+                let playlists: Vec<CardData> = demo_items
+                    .iter()
+                    .filter(|it| matches!(it.id, ItemId::Playlist(_)))
+                    .map(|it| CardData::from_ytm(app, it, page))
+                    .collect();
+                let albums: Vec<CardData> = demo_items
+                    .iter()
+                    .filter(|it| matches!(it.id, ItemId::Album(_)))
+                    .map(|it| CardData::from_ytm(app, it, page))
+                    .collect();
+                let artists: Vec<CardData> = demo_items
+                    .iter()
+                    .filter(|it| matches!(it.id, ItemId::Artist(_)))
+                    .map(|it| CardData::from_ytm(app, it, page))
+                    .collect();
+                let song_cards: Vec<CardData> = demo_items
+                    .iter()
+                    .filter(|it| matches!(it.id, ItemId::Song(_)))
+                    .map(|it| CardData::from_ytm(app, it, page))
+                    .collect();
+
+                if !playlists.is_empty() {
+                    let h = match app.lang() {
+                        crate::library::Lang::Vi => format!("Nhạc {title} không thể bỏ lỡ"),
+                        crate::library::Lang::En => format!("Essential {title} playlists"),
+                    };
+                    draw_carousel_shelf(app, ui, "cat-playlists", &h, &playlists, side);
+                }
+                if !song_cards.is_empty() {
+                    let h = app.t("Khám phá âm nhạc mới", "Discover new music");
+                    draw_carousel_shelf(app, ui, "cat-songs", h, &song_cards, side);
+                }
+                if !albums.is_empty() {
+                    let h = app.t("Album nổi bật", "Featured albums");
+                    draw_carousel_shelf(app, ui, "cat-albums", h, &albums, side);
+                }
+                if !artists.is_empty() {
+                    let h = app.t("Nghệ sĩ tiêu biểu", "Featured artists");
+                    draw_carousel_shelf(app, ui, "cat-artists", h, &artists, side);
+                }
+                ui.add_space(24.0);
+                return;
+            }
+        }
+
         let chips_h = 56.0;
 
         ui.add_space(chips_h);
@@ -973,6 +1061,19 @@ fn draw_browse_all(app: &mut App, ui: &mut Ui) {
         let (grid, _) = ui.allocate_exact_size(Vec2::new(w, total_h), Sense::hover());
         let title_font_sz = if inner_w <= 520.0 { 16.0 } else { 22.0 };
 
+        let mut real_covers: Vec<(String, String)> = Vec::new();
+        if !app.lib.demo {
+            let mut seen_urls = std::collections::HashSet::new();
+            for t in app.lib.tracks.values() {
+                if let Some(url) = t.art_url.as_deref().filter(|u| !u.is_empty()) {
+                    if seen_urls.insert(url.to_string()) {
+                        real_covers.push((t.cover_key(), url.to_string()));
+                    }
+                }
+            }
+            real_covers.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
         for (i, cat) in BROWSE_CATEGORIES.iter().enumerate() {
             let (c, r) = (i % cols, i / cols);
             let rect = Rect::from_min_size(
@@ -982,12 +1083,17 @@ fn draw_browse_all(app: &mut App, ui: &mut Ui) {
             if !ui.is_rect_visible(rect) {
                 continue;
             }
-            let resp = ui.interact(rect, ui.scope_id().with(("browse-cat", i)), Sense::click());
+            let resp = ui.interact(rect, ui.scope_id().with(("browse-cat", i)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             let fill = if resp.hovered() { cat.color.lerp_to_gamma(TEXT, 0.08) } else { cat.color };
             ui.painter().rect_filled(rect, RADIUS_CARD, fill);
 
             // Bottom-right 25deg tilted cover artwork clipped cleanly inside the 8px rounded card.
-            let tex = app.art.get(ui.ctx(), &format!("cat:{}", cat.query), None);
+            let tex = if let Some((k, src)) = real_covers.get(i % real_covers.len().max(1)).filter(|_| !real_covers.is_empty()) {
+                app.art.get(ui.ctx(), k, Some(src.as_str()))
+            } else {
+                app.art.get(ui.ctx(), &format!("cat:{}", cat.query), None)
+            };
             draw_tilted_art(ui, rect, &tex);
 
             let label = app.t(cat.vi, cat.en);

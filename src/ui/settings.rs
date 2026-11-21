@@ -8,7 +8,7 @@ use eframe::egui::{
 use super::icons::{self, Icon};
 use super::widgets::*;
 use crate::app::{Action, App};
-use crate::library::{data_dir, fold, Lang, NormLevel};
+use crate::library::{data_dir, fold, Lang, NormLevel, SurfaceStyle};
 use crate::mechanics::{CROSSFADE_MAX_S, EQ_BANDS, EQ_PRESETS, EQ_RANGE_DB};
 use crate::theme::*;
 
@@ -407,6 +407,11 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
     // 5. Display & Lyrics
     {
         let sec = t("Hiển thị & Lời bài hát", "Display & Lyrics");
+        let sf_title = t("Bề mặt giao diện (Blur / Acrylic)", "Window surface style (Blur / Acrylic)");
+        let sf_desc = t(
+            "Chọn nền tối mặc định, làm mờ theo ảnh bìa (Ambient Blur) hoặc hiệu ứng kính mờ Acrylic.",
+            "Choose classic dark chrome, live blurred artwork backdrop, or frosted Acrylic glass.",
+        );
         let ct_title = t("Danh sách bài hát thu gọn", "Use compact tracklist layout");
         let ct_desc = t("Hiển thị nhiều bài hát hơn trên mỗi trang với dòng mỏng hơn.", "Fit more tracks on screen with denser rows.");
         let lm_title = t("Hiệu ứng lời bài hát", "Lyrics motion");
@@ -416,14 +421,39 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
         let rt_title = t("Hiển thị thời gian còn lại", "Show remaining track time");
         let rt_desc = t("Hiển thị bộ đếm ngược âm ở góc phải thanh phát nhạc.", "Show negative countdown on the player scrubber.");
 
+        let show_sf = matches_query(&query, sec, sf_title, sf_desc);
         let show_ct = matches_query(&query, sec, ct_title, ct_desc);
         let show_lm = matches_query(&query, sec, lm_title, lm_desc);
         let show_rm = matches_query(&query, sec, rm_title, rm_desc);
         let show_rt = matches_query(&query, sec, rt_title, rt_desc);
-        if show_ct || show_lm || show_rm || show_rt {
+        if show_sf || show_ct || show_lm || show_rm || show_rt {
             matched_any = true;
             section_header(ui, sec);
             let s = &mut app.data.settings;
+            if show_sf {
+                pref_row(ui, col_w, sf_title, sf_desc, |ui| {
+                    let lbl_std = t("Mặc định (Tối)", "Standard (Dark)");
+                    let lbl_blur = t("Mờ ảnh bìa (Blur)", "Ambient Blur");
+                    let lbl_acrylic = t("Kính mờ (Acrylic)", "Frosted Acrylic");
+                    let cur_lbl = match s.surface_style {
+                        SurfaceStyle::Standard => lbl_std,
+                        SurfaceStyle::AmbientBlur => lbl_blur,
+                        SurfaceStyle::Acrylic => lbl_acrylic,
+                    };
+                    changed |= spotify_select(
+                        ui,
+                        "settings-surface-style",
+                        cur_lbl,
+                        196.0,
+                        &[
+                            (SurfaceStyle::Standard, lbl_std),
+                            (SurfaceStyle::AmbientBlur, lbl_blur),
+                            (SurfaceStyle::Acrylic, lbl_acrylic),
+                        ],
+                        &mut s.surface_style,
+                    );
+                });
+            }
             if show_ct {
                 pref_row(ui, col_w, ct_title, ct_desc, |ui| {
                     changed |= toggle_switch(ui, &mut s.compact_tracklist);

@@ -2043,9 +2043,11 @@ fn render_lyrics_scroll_body(
 
             let line_w = (total_width - left_margin.max(0.0) * 2.0)
                 .clamp(120.0, 760.0);
+            let centered_left = ((total_width - line_w) * 0.5).max(0.0);
             ui.horizontal(|ui| {
-                if left_margin > 0.0 {
-                    ui.add_space(left_margin);
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if centered_left > 0.0 {
+                    ui.add_space(centered_left);
                 }
                 ui.vertical(|ui| {
                     ui.set_width(line_w);
@@ -2201,9 +2203,12 @@ fn render_lyrics_scroll_body(
                             ui.ctx().request_repaint();
                         }
                         if now_hovered && line.time_ms.is_some() {
-                            let pill = text_rect
-                                .translate(Vec2::new(0.0, lift_px - content_origin_y))
-                                .expand2(Vec2::new(16.0, 9.0));
+                            // Optically center Vietnamese ascenders/descenders inside the rounded hover pill.
+                            let shifted = text_rect.translate(Vec2::new(0.0, lift_px - content_origin_y));
+                            let pill = Rect::from_min_max(
+                                Pos2::new(shifted.min.x - 16.0, shifted.min.y - 10.0),
+                                Pos2::new(shifted.max.x + 16.0, shifted.max.y + 6.0),
+                            );
                             hovered_content_rect = Some(pill);
                         }
                         if is_focus {
