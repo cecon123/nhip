@@ -18,7 +18,8 @@ pub trait Source: Send {
     fn duration_ms(&self) -> u64;
     /// Appends stereo frames; returns false once the stream has ended.
     fn fill(&mut self, out: &mut VecDeque<f32>) -> bool;
-    fn seek(&mut self, ms: u64) -> bool;
+    /// Seeks to `ms`; returns `Some(actual_ms)` on success or `None` if the underlying stream failed to seek.
+    fn seek(&mut self, ms: u64) -> Option<u64>;
 }
 
 pub struct FileSource {
@@ -73,8 +74,17 @@ impl FileSource {
     }
 
     pub fn seek_to_ms(&mut self, ms: u64) -> Result<Option<u64>, String> {
-        let time = Time::try_from_secs_f64(ms as f64 / 1000.0).ok_or("invalid seek time")?;
-        let result = self.format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) });
+        let clamped_ms = if self.duration_ms > 100 {
+            ms.min(self.duration_ms.saturating_sub(50))
+        } else {
+            ms
+        };
+        let time = Time::try_from_secs_f64(clamped_ms as f64 / 1000.0).ok_or("invalid seek time")?;
+        let track_id = Some(self.track_id);
+        let result = self
+            .format
+            .seek(SeekMode::Accurate, SeekTo::Time { time, track_id })
+            .or_else(|_| self.format.seek(SeekMode::Coarse, SeekTo::Time { time, track_id }));
         self.decoder.reset();
         let seeked = result.map_err(|e| e.to_string())?;
         Ok(self.time_base.and_then(|tb| tb.calc_time(seeked.actual_ts)).map(|t| (t.as_secs_f64() * 1000.0) as u64))
@@ -133,8 +143,8 @@ impl Source for FileSource {
         }
     }
 
-    fn seek(&mut self, ms: u64) -> bool {
-        self.seek_to_ms(ms).is_ok()
+    fn seek(&mut self, ms: u64) -> Option<u64> {
+        self.seek_to_ms(ms).ok().map(|actual| actual.unwrap_or(ms))
     }
 }
 
@@ -251,9 +261,9 @@ impl Source for DemoSource {
         true
     }
 
-    fn seek(&mut self, ms: u64) -> bool {
+    fn seek(&mut self, ms: u64) -> Option<u64> {
         self.pos = (ms * DEMO_RATE as u64 / 1000).min(self.frames);
-        true
+        Some(self.pos * 1000 / DEMO_RATE as u64)
     }
 }
 

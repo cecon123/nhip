@@ -224,14 +224,14 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
         draw_view_controls(app, ui, bounds, false, 1.0, motion_on);
     }
 
-    // Repaint scheduling: keep Kawarp dynamic backdrop & lyric sweep fluid at ~60fps while visible.
+    // Repaint scheduling: keep Kawarp dynamic backdrop & lyric sweep fluid at ~60fps without spinning 100% CPU.
     let synced_playing = playing
         && app
             .current_lyrics()
             .is_some_and(|l| l.synced);
     if lyrics_visible && (animating_backdrop || synced_playing || motion_on) {
         if motion_on && (animating_backdrop || synced_playing) {
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
         } else {
             ui.ctx().request_repaint_after(Duration::from_millis(42));
         }
@@ -2066,8 +2066,10 @@ fn render_lyrics_scroll_body(
                         (8.0, (height * 0.16).clamp(68.0, 118.0))
                     };
                     if lyrics.synced {
-                        if let Some(first_ms) = first_vocal_ms.filter(|&ms| ms >= 2_500) {
-                            if eff_pos < first_ms {
+                        if let Some(first_ms) = first_vocal_ms {
+                            if eff_pos < first_ms
+                                && should_render_synthetic_intro_dots(&lyrics.lines, first_ms)
+                            {
                                 let dots_r = paint_interlude_dots(
                                     ui,
                                     font_size,
@@ -2099,19 +2101,9 @@ fn render_lyrics_scroll_body(
                     let mut hovered_content_rect: Option<Rect> = None;
 
                     for (index, line) in lyrics.lines.iter().enumerate() {
-                        // Detect if a mid-song instrumental interlude gap (>= 3.5s) follows this main line.
-                        let next_main_start = if !line.background {
-                            lyrics.lines[index + 1..]
-                                .iter()
-                                .find(|n| !n.background)
-                                .and_then(|n| n.time_ms)
-                        } else {
-                            None
-                        };
-                        let interlude_gap = line.end_ms.and_then(|end| {
-                            let ns = next_main_start?;
-                            (ns >= end.saturating_add(3_500)).then_some((end, ns))
-                        });
+                        // Detect if a mid-song instrumental interlude gap (>= 3.5s) follows this main line,
+                        // suppressing synthetic dots whenever an explicit instrumental line already covers the break.
+                        let interlude_gap = synthetic_mid_interlude_gap(&lyrics.lines, index);
                         let in_following_gap = interlude_gap
                             .is_some_and(|(gs, ge)| eff_pos >= gs && eff_pos < ge);
                         let is_focus = active == Some(index) && !in_following_gap;
@@ -2160,28 +2152,29 @@ fn render_lyrics_scroll_body(
                         let line_end_ms = lyrics.lines.get(index + 1).and_then(|n| n.time_ms);
 
                         if lyrics.synced && is_instrumental_line(&line.text) && line.time_ms.is_some() {
-                            let start_ms = line.time_ms.unwrap_or(0);
-                            let end_ms = line
-                                .end_ms
-                                .or(line_end_ms)
-                                .unwrap_or(start_ms + 4_000)
-                                .max(start_ms + 500);
-                            let dots_r = paint_interlude_dots(
-                                ui,
-                                font_size,
-                                eff_pos,
-                                start_ms,
-                                end_ms,
-                                is_focus,
-                                motion_on,
-                                fade_rect,
-                                fade_h,
-                            );
-                            if is_focus {
-                                active_rect_seen = Some(dots_r);
-                                active_content_center_y = Some(dots_r.center().y - content_origin_y);
+                            // Collapse consecutive instrumental/blank lines into a single `• • •` interlude.
+                            if let Some((start_ms, end_ms, run_end_idx)) =
+                                explicit_instrumental_span(&lyrics.lines, index)
+                            {
+                                let run_active = active
+                                    .is_some_and(|cur| cur >= index && cur <= run_end_idx);
+                                let dots_r = paint_interlude_dots(
+                                    ui,
+                                    font_size,
+                                    eff_pos,
+                                    start_ms,
+                                    end_ms,
+                                    run_active,
+                                    motion_on,
+                                    fade_rect,
+                                    fade_h,
+                                );
+                                if run_active {
+                                    active_rect_seen = Some(dots_r);
+                                    active_content_center_y = Some(dots_r.center().y - content_origin_y);
+                                }
+                                ui.add_space(row_gap);
                             }
-                            ui.add_space(row_gap);
                             continue;
                         }
 
@@ -2600,6 +2593,81 @@ fn spicy_y_offset_spline(t: f32) -> f32 {
 fn is_instrumental_line(text: &str) -> bool {
     let t = text.trim();
     t.is_empty() || matches!(t, "♪" | "♫" | "♬" | "..." | "…" | "• • •")
+}
+
+/// Returns true if synthetic intro `• • •` dots should be inserted before `first_vocal_ms`,
+/// suppressing them whenever the lyrics already contain an explicit instrumental line beforehand.
+fn should_render_synthetic_intro_dots(lines: &[LyricLine], first_vocal_ms: u64) -> bool {
+    if first_vocal_ms < 2_500 {
+        return false;
+    }
+    !lines
+        .iter()
+        .any(|l| is_instrumental_line(&l.text) && l.time_ms.is_some_and(|t| t < first_vocal_ms))
+}
+
+/// Returns a synthetic mid-song `(gap_start_ms, gap_end_ms)` interlude after `lines[index]`
+/// only when there is a >= 3.5s gap to the next main vocal line AND no explicit instrumental line
+/// already covers that break (preventing double `• • •` dots).
+fn synthetic_mid_interlude_gap(lines: &[LyricLine], index: usize) -> Option<(u64, u64)> {
+    let line = lines.get(index)?;
+    if line.background || is_instrumental_line(&line.text) {
+        return None;
+    }
+    let end = line.end_ms?;
+    let mut next_main_idx = None;
+    for (offset, cand) in lines[index + 1..].iter().enumerate() {
+        let cand_idx = index + 1 + offset;
+        if is_instrumental_line(&cand.text) && cand.time_ms.is_some() {
+            // An explicit instrumental/blank timed line already handles this interlude.
+            return None;
+        }
+        if !cand.background {
+            next_main_idx = Some(cand_idx);
+            break;
+        }
+    }
+    let next_start = lines.get(next_main_idx?)?.time_ms?;
+    (next_start >= end.saturating_add(3_500)).then_some((end, next_start))
+}
+
+/// Collapses a run of one or more consecutive explicit instrumental/blank timed lines into a single
+/// `(start_ms, end_ms, run_end_index)` span on the first line of the run (returning `None` for
+/// subsequent lines in the run or sub-2s empty LRC spacers).
+fn explicit_instrumental_span(lines: &[LyricLine], index: usize) -> Option<(u64, u64, usize)> {
+    let line = lines.get(index)?;
+    let start_ms = line.time_ms?;
+    if !is_instrumental_line(&line.text) {
+        return None;
+    }
+    // Suppress duplicate dots when the immediately preceding timed line was already instrumental.
+    if index > 0 {
+        let prev = &lines[index - 1];
+        if is_instrumental_line(&prev.text) && prev.time_ms.is_some() {
+            return None;
+        }
+    }
+    let mut run_end = index;
+    let mut explicit_symbol = !line.text.trim().is_empty();
+    while let Some(next) = lines.get(run_end + 1) {
+        if is_instrumental_line(&next.text) && next.time_ms.is_some() {
+            explicit_symbol |= !next.text.trim().is_empty();
+            run_end += 1;
+        } else {
+            break;
+        }
+    }
+    let next_vocal_ms = lines.get(run_end + 1).and_then(|n| n.time_ms);
+    let end_ms = lines[run_end]
+        .end_ms
+        .or(next_vocal_ms)
+        .unwrap_or(start_ms + 4_000)
+        .max(start_ms + 500);
+    // Ignore tiny (< 2.2s) blank timestamped spacer lines that aren't real musical interludes.
+    if !explicit_symbol && end_ms.saturating_sub(start_ms) < 2_200 {
+        return None;
+    }
+    Some((start_ms, end_ms, run_end))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3057,8 +3125,15 @@ fn line_seek_time(line: &LyricLine, char_index: Option<usize>) -> Option<u64> {
         .or(line.time_ms)
 }
 
+#[derive(Clone, Default)]
+struct BalancedWidthCache {
+    entries: std::collections::HashMap<u64, f32>,
+}
+
 /// Lays out a lyric line at constant base font size with CSS `text-wrap: balance` semantics
 /// so wrapped lines never leave lonely 1-word orphans and never re-wrap when scaled.
+/// Memoizes the solved balanced width per `(text, size, wrap_w, right_align)` so scrolling at 60fps
+/// shapes each line once per frame instead of 7 times.
 fn layout_balanced_lyric(
     ui: &Ui,
     display: &str,
@@ -3066,6 +3141,7 @@ fn layout_balanced_lyric(
     wrap_w: f32,
     right_align: bool,
 ) -> std::sync::Arc<egui::Galley> {
+    use std::hash::{Hash, Hasher};
     let font = lyric_font(ui, size);
     let make = |w: f32| {
         let mut job = egui::text::LayoutJob::single_section(
@@ -3081,34 +3157,59 @@ fn layout_balanced_lyric(
         job.halign = if right_align { Align::RIGHT } else { Align::LEFT };
         ui.painter().layout_job(job)
     };
+    if display.len() > 240 {
+        return make(wrap_w);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    display.hash(&mut hasher);
+    (size.round() as i32).hash(&mut hasher);
+    (wrap_w.round() as i32).hash(&mut hasher);
+    right_align.hash(&mut hasher);
+    let cache_key = hasher.finish();
+    let cache_id = egui::Id::NULL.with("lyrics-balanced-w-cache");
+    if let Some(cached_w) = ui
+        .ctx()
+        .data(|d| d.get_temp::<BalancedWidthCache>(cache_id).and_then(|c| c.entries.get(&cache_key).copied()))
+    {
+        return make(cached_w);
+    }
+
     let galley = make(wrap_w);
     let row_count = galley.rows.len();
-    if row_count < 2 || display.len() > 240 {
-        return galley;
-    }
-    let max_row_w = galley
-        .rows
-        .iter()
-        .map(|r| r.size.x)
-        .fold(0.0_f32, f32::max);
-    let last_row_w = galley.rows.last().map(|r| r.size.x).unwrap_or(max_row_w);
-    // Re-balance whenever the last wrapped line is disproportionately short (< 50% of widest row).
-    if max_row_w <= 1.0 || last_row_w >= max_row_w * 0.50 {
-        return galley;
-    }
-    let mut lo = (max_row_w * 0.54).max(120.0);
-    let mut hi = max_row_w;
+    let mut solved_w = wrap_w;
     let mut best = galley;
-    for _ in 0..6 {
-        let mid = (lo + hi) * 0.5;
-        let cand = make(mid);
-        if cand.rows.len() <= row_count {
-            best = cand;
-            hi = mid;
-        } else {
-            lo = mid;
+    if row_count >= 2 {
+        let max_row_w = best
+            .rows
+            .iter()
+            .map(|r| r.size.x)
+            .fold(0.0_f32, f32::max);
+        let last_row_w = best.rows.last().map(|r| r.size.x).unwrap_or(max_row_w);
+        // Re-balance whenever the last wrapped line is disproportionately short (< 50% of widest row).
+        if max_row_w > 1.0 && last_row_w < max_row_w * 0.50 {
+            let mut lo = (max_row_w * 0.54).max(120.0);
+            let mut hi = max_row_w;
+            for _ in 0..6 {
+                let mid = (lo + hi) * 0.5;
+                let cand = make(mid);
+                if cand.rows.len() <= row_count {
+                    best = cand;
+                    solved_w = mid;
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
         }
     }
+    ui.ctx().data_mut(|d| {
+        let mut cache = d.get_temp::<BalancedWidthCache>(cache_id).unwrap_or_default();
+        if cache.entries.len() >= 512 {
+            cache.entries.clear();
+        }
+        cache.entries.insert(cache_key, solved_w);
+        d.insert_temp(cache_id, cache);
+    });
     best
 }
 
@@ -3253,6 +3354,7 @@ fn line_widget(
         if !rect.intersects(viewport.expand(18.0)) {
             return (resp, text_rect, target);
         }
+        let scaled_base = scale_galley_in_place(base_galley, scale);
         // Line-synced mode (no word/syllable spans): authentic Spotify / Spicy Lyrics 180° top-to-bottom illumination wave!
         if line.spans.is_empty() {
             let start = line.time_ms.unwrap_or(pos);
@@ -3278,55 +3380,46 @@ fn line_widget(
                 (-0.707, -0.707),
             ];
             for dir in OCT_DIRS {
-                let halo = scale_galley_in_place(
-                    make_vertical_line_galley(
-                        &base_galley,
-                        progress,
-                        true,
-                        dir,
-                        1.6,
-                        24.0,
-                        origin,
-                        viewport,
-                        pad_h,
-                        fade_h,
-                    ),
-                    scale,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-            for dir in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                let halo = scale_galley_in_place(
-                    make_vertical_line_galley(
-                        &base_galley,
-                        progress,
-                        true,
-                        dir,
-                        3.4,
-                        14.0,
-                        origin,
-                        viewport,
-                        pad_h,
-                        fade_h,
-                    ),
-                    scale,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-            let fg = scale_galley_in_place(
-                make_vertical_line_galley(
-                    &base_galley,
+                let halo = make_vertical_line_galley(
+                    &scaled_base,
                     progress,
-                    false,
-                    (0.0, 0.0),
-                    0.0,
-                    0.0,
+                    true,
+                    dir,
+                    1.6,
+                    24.0,
                     origin,
                     viewport,
                     pad_h,
                     fade_h,
-                ),
-                scale,
+                );
+                ui.painter().galley(origin, halo, Color32::WHITE);
+            }
+            for dir in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                let halo = make_vertical_line_galley(
+                    &scaled_base,
+                    progress,
+                    true,
+                    dir,
+                    3.4,
+                    14.0,
+                    origin,
+                    viewport,
+                    pad_h,
+                    fade_h,
+                );
+                ui.painter().galley(origin, halo, Color32::WHITE);
+            }
+            let fg = make_vertical_line_galley(
+                &scaled_base,
+                progress,
+                false,
+                (0.0, 0.0),
+                0.0,
+                0.0,
+                origin,
+                viewport,
+                pad_h,
+                fade_h,
             );
             ui.painter().galley(origin, fg, Color32::WHITE);
             return (resp, text_rect, target);
@@ -3339,7 +3432,7 @@ fn line_widget(
             size,
             motion_on,
         );
-        let row_char_map = map_galley_glyphs_to_chars(&base_galley, display);
+        let row_char_map = map_galley_glyphs_to_chars(&scaled_base, display);
         if char_anims.iter().any(|a| a.glow > 0.03) {
             // Soft glyph-shaped text-shadow halo rings (Spicy Lyrics main.css:24)
             const OCT_DIRS: [(f32, f32); 8] = [
@@ -3353,74 +3446,47 @@ fn line_widget(
                 (-0.707, -0.707),
             ];
             for dir in OCT_DIRS {
-                let halo = scale_galley_in_place(
-                    make_tinted_galley(
-                        &base_galley,
-                        &row_char_map,
-                        &char_anims,
-                        dir,
-                        0.13,
-                        true,
-                        origin,
-                        viewport,
-                        pad_h,
-                        fade_h,
-                    ),
-                    scale,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-            for dir in OCT_DIRS {
-                let halo = scale_galley_in_place(
-                    make_tinted_galley(
-                        &base_galley,
-                        &row_char_map,
-                        &char_anims,
-                        dir,
-                        0.24,
-                        true,
-                        origin,
-                        viewport,
-                        pad_h,
-                        fade_h,
-                    ),
-                    scale,
+                let halo = make_tinted_galley(
+                    &scaled_base,
+                    &row_char_map,
+                    &char_anims,
+                    dir,
+                    0.16,
+                    true,
+                    origin,
+                    viewport,
+                    pad_h,
+                    fade_h,
                 );
                 ui.painter().galley(origin, halo, Color32::WHITE);
             }
             for dir in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                let halo = scale_galley_in_place(
-                    make_tinted_galley(
-                        &base_galley,
-                        &row_char_map,
-                        &char_anims,
-                        dir,
-                        0.34,
-                        true,
-                        origin,
-                        viewport,
-                        pad_h,
-                        fade_h,
-                    ),
-                    scale,
+                let halo = make_tinted_galley(
+                    &scaled_base,
+                    &row_char_map,
+                    &char_anims,
+                    dir,
+                    0.30,
+                    true,
+                    origin,
+                    viewport,
+                    pad_h,
+                    fade_h,
                 );
                 ui.painter().galley(origin, halo, Color32::WHITE);
             }
         }
-        let fg = scale_galley_in_place(
-            make_tinted_galley(
-                &base_galley,
-                &row_char_map,
-                &char_anims,
-                (0.0, 0.0),
-                0.0,
-                false,
-                origin,
-                viewport,
-                pad_h,
-                fade_h,
-            ),
-            scale,
+        let fg = make_tinted_galley(
+            &scaled_base,
+            &row_char_map,
+            &char_anims,
+            (0.0, 0.0),
+            0.0,
+            false,
+            origin,
+            viewport,
+            pad_h,
+            fade_h,
         );
         ui.painter().galley(origin, fg, Color32::WHITE);
         return (resp, text_rect, target);
@@ -3433,57 +3499,43 @@ fn line_widget(
             let tap_alpha = |w: f32| -> u8 {
                 (255.0 * (1.0 - (1.0 - a_target).powf(w))).round().clamp(1.0, 255.0) as u8
             };
-            // 3-ring isotropic Gaussian disc kernel (29 radial taps, per-vertex Y-masked, `BlurMultiplier = 1.25`)
+            // 2-ring isotropic Gaussian disc kernel (13 radial taps, per-vertex Y-masked, `BlurMultiplier = 1.25`)
             let g0 = mask_galley_vertical(
                 &scaled,
                 origin,
                 viewport,
                 pad_h,
                 fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.28))),
+                Some(Color32::from_white_alpha(tap_alpha(0.30))),
             );
             ui.painter().galley(origin, g0, Color32::WHITE);
 
-            let r1 = blur_px * 0.24;
+            let r1 = blur_px * 0.30;
             let g1 = mask_galley_vertical(
                 &scaled,
                 origin,
                 viewport,
                 pad_h,
                 fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.065))),
+                Some(Color32::from_white_alpha(tap_alpha(0.075))),
             );
             for k in 0..6 {
                 let (s, c) = (k as f32 * std::f32::consts::TAU / 6.0).sin_cos();
                 ui.painter().galley(origin + Vec2::new(c * r1, s * r1), g1.clone(), Color32::WHITE);
             }
 
-            let r2 = blur_px * 0.48;
+            let r2 = blur_px * 0.62;
             let g2 = mask_galley_vertical(
                 &scaled,
                 origin,
                 viewport,
                 pad_h,
                 fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.023))),
+                Some(Color32::from_white_alpha(tap_alpha(0.042))),
             );
-            for k in 0..10 {
-                let (s, c) = (k as f32 * std::f32::consts::TAU / 10.0 + 0.31).sin_cos();
+            for k in 0..6 {
+                let (s, c) = (k as f32 * std::f32::consts::TAU / 6.0 + 0.52).sin_cos();
                 ui.painter().galley(origin + Vec2::new(c * r2, s * r2), g2.clone(), Color32::WHITE);
-            }
-
-            let r3 = blur_px * 0.74;
-            let g3 = mask_galley_vertical(
-                &scaled,
-                origin,
-                viewport,
-                pad_h,
-                fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.0085))),
-            );
-            for k in 0..12 {
-                let (s, c) = (k as f32 * std::f32::consts::TAU / 12.0 + 0.13).sin_cos();
-                ui.painter().galley(origin + Vec2::new(c * r3, s * r3), g3.clone(), Color32::WHITE);
             }
         }
         return (resp, text_rect, target);
@@ -5780,5 +5832,55 @@ mod tests {
         }
         assert_eq!(st.opacity, 0.0);
         assert!(st.rect.is_none());
+    }
+
+    #[test]
+    fn interlude_dots_deduplicate_intro_mid_and_consecutive_instrumental_lines() {
+        let mk = |t: u64, end: Option<u64>, text: &str| LyricLine {
+            time_ms: Some(t),
+            end_ms: end,
+            text: text.to_string(),
+            spans: Vec::new(),
+            right_align: false,
+            background: false,
+        };
+
+        // 1. Intro: explicit `♪` before first vocal suppresses synthetic intro dots; absent -> allows synthetic.
+        let with_explicit_intro = vec![mk(0, Some(6_000), "♪"), mk(6_000, Some(10_000), "First vocal")];
+        assert!(!should_render_synthetic_intro_dots(&with_explicit_intro, 6_000));
+        let without_explicit_intro = vec![mk(6_000, Some(10_000), "First vocal")];
+        assert!(should_render_synthetic_intro_dots(&without_explicit_intro, 6_000));
+
+        // 2. Mid-song: explicit `...` between two vocals suppresses synthetic mid-song gap dots.
+        let with_mid_explicit = vec![
+            mk(1_000, Some(5_000), "Verse 1"),
+            mk(6_000, Some(12_000), "..."),
+            mk(12_500, Some(16_000), "Verse 2"),
+        ];
+        assert_eq!(synthetic_mid_interlude_gap(&with_mid_explicit, 0), None);
+        assert_eq!(explicit_instrumental_span(&with_mid_explicit, 1), Some((6_000, 12_000, 1)));
+
+        // 3. Consecutive explicit instrumental/blank lines collapse to a SINGLE span on index 0.
+        let consecutive = vec![
+            mk(10_000, Some(14_000), ""),
+            mk(14_000, Some(18_000), "♪"),
+            mk(20_000, Some(24_000), "Chorus"),
+        ];
+        assert_eq!(explicit_instrumental_span(&consecutive, 0), Some((10_000, 18_000, 1)));
+        assert_eq!(explicit_instrumental_span(&consecutive, 1), None);
+
+        // 4. Short (< 2.2s) blank LRC spacer does NOT spawn spurious `• • •`.
+        let short_spacer = vec![
+            mk(10_000, Some(11_000), ""),
+            mk(11_200, Some(15_000), "Next vocal"),
+        ];
+        assert_eq!(explicit_instrumental_span(&short_spacer, 0), None);
+
+        // 5. Pure vocal gap >= 3.5s with NO explicit instrumental line still gets synthetic dots.
+        let pure_gap = vec![
+            mk(1_000, Some(5_000), "Verse 1"),
+            mk(10_000, Some(14_000), "Verse 2"),
+        ];
+        assert_eq!(synthetic_mid_interlude_gap(&pure_gap, 0), Some((5_000, 10_000)));
     }
 }

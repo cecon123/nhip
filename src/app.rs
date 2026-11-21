@@ -308,6 +308,7 @@ pub struct App {
     lyrics_response: Option<Receiver<Option<Lyrics>>>,
     session_played_yt: HashSet<String>,
     last_yt_seed: Option<String>,
+    last_prefetched_next: Option<TrackId>,
     autoplay_req_id: u64,
     autoplay_response: Option<(u64, bool, Receiver<Result<Vec<crate::ytm::Item>, crate::ytm::Error>>)>,
     pub top_popover: Option<TopPopover>,
@@ -413,6 +414,7 @@ impl App {
             lyrics_response: None,
             session_played_yt: HashSet::new(),
             last_yt_seed: None,
+            last_prefetched_next: None,
             autoplay_req_id: 0,
             autoplay_response: None,
             top_popover: None,
@@ -886,9 +888,12 @@ impl App {
 
     fn seek(&mut self, ms: u64) {
         if let Some(id) = self.player.current {
-            self.engine.seek(id, ms);
-            self.sync_next();
-            self.dirty = true;
+            if self.engine.has_song() {
+                self.engine.seek(id, ms);
+                self.dirty = true;
+            } else {
+                self.start_track(id, ms, !self.engine.is_paused());
+            }
         }
     }
 
@@ -955,8 +960,10 @@ impl App {
         });
         self.engine.set_next(spec);
 
-        // Proactively prefetch next track's artwork, YouTube audio stream URL, and synced lyrics (skip in headless/screenshot mode).
-        if self.screenshot.is_none() && !self.lib.demo {
+        // Proactively prefetch next track's artwork, YouTube audio stream URL, and synced lyrics once per next-track change.
+        let next_id = next.as_ref().map(|t| t.id);
+        if self.screenshot.is_none() && !self.lib.demo && next_id != self.last_prefetched_next {
+            self.last_prefetched_next = next_id;
             if let Some(next_track) = next {
                 self.art.prefetch(&next_track.cover_key(), next_track.art_source());
                 if let Some(vid) = next_track.youtube_id() {
@@ -2783,6 +2790,7 @@ pub(crate) mod tests {
             lyrics_response: None,
             session_played_yt: HashSet::new(),
             last_yt_seed: None,
+            last_prefetched_next: None,
             autoplay_req_id: 0,
             autoplay_response: None,
             top_popover: None,

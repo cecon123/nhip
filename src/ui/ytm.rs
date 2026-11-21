@@ -2417,7 +2417,7 @@ fn draw_song_row(
     let round = if matches!(item.id, ItemId::Artist(_)) { 20.0 } else { 4.0 };
     cover(ui, art_r, &tex, round);
 
-    if hovered && matches!(item.id, ItemId::Song(_)) {
+    if !indexed && hovered && matches!(item.id, ItemId::Song(_)) {
         ui.painter().rect_filled(art_r, round, Color32::from_black_alpha(155));
         let tip = if is_playing { app.t("Tạm dừng", "Pause") } else { app.t("Phát", "Play") };
         if icon_button(ui, art_r, ("srow-art-play", i), if is_playing { Icon::Pause } else { Icon::Play }, TEXT, tip).clicked() {

@@ -14,6 +14,8 @@ pub use crate::library::cover_key;
 struct Decoded {
     key: String,
     image: Option<ColorImage>,
+    backdrop: Option<ColorImage>,
+    colors: Option<[Color32; 4]>,
 }
 
 pub struct ArtCache {
@@ -37,7 +39,11 @@ impl ArtCache {
             .spawn(move || {
                 while let Ok((key, path)) = rx.recv() {
                     let image = read_cover(&path);
-                    if tx.send(Decoded { key, image }).is_err() {
+                    let (backdrop, colors) = match &image {
+                        Some(img) => (Some(spicy_backdrop_image(img)), Some(cover_colors(img))),
+                        None => (None, None),
+                    };
+                    if tx.send(Decoded { key, image, backdrop, colors }).is_err() {
                         break;
                     }
                     ctx.request_repaint();
@@ -58,21 +64,42 @@ impl ArtCache {
     }
 
     pub fn pump(&mut self, ctx: &egui::Context) {
-        while let Ok(d) = self.results.try_recv() {
+        const MAX_UPLOADS_PER_FRAME: usize = 4;
+        let mut uploaded = 0usize;
+        while uploaded < MAX_UPLOADS_PER_FRAME {
+            let Ok(d) = self.results.try_recv() else { break };
             self.pending = self.pending.saturating_sub(1);
             if let Some(img) = d.image {
-                self.inject_image(ctx, &d.key, img);
+                let colors = d.colors.unwrap_or_else(|| cover_colors(&img));
+                let bd_img = d.backdrop.unwrap_or_else(|| spicy_backdrop_image(&img));
+                self.insert_precomputed(ctx, &d.key, img, bd_img, colors);
+                uploaded += 1;
             }
+        }
+        if uploaded == MAX_UPLOADS_PER_FRAME {
+            ctx.request_repaint();
         }
     }
 
-    pub fn inject_image(&mut self, ctx: &egui::Context, key: &str, img: ColorImage) {
-        self.colors.insert(key.to_string(), cover_colors(&img));
-        let bd_img = spicy_backdrop_image(&img);
+    fn insert_precomputed(
+        &mut self,
+        ctx: &egui::Context,
+        key: &str,
+        img: ColorImage,
+        bd_img: ColorImage,
+        colors: [Color32; 4],
+    ) {
+        self.colors.insert(key.to_string(), colors);
         let bd_tex = ctx.load_texture(format!("backdrop:{key}"), bd_img, TextureOptions::LINEAR);
         self.backdrops.insert(key.to_string(), bd_tex);
         let tex = ctx.load_texture(format!("cover:{key}"), img, TextureOptions::LINEAR);
         self.textures.insert(key.to_string(), tex);
+    }
+
+    pub fn inject_image(&mut self, ctx: &egui::Context, key: &str, img: ColorImage) {
+        let colors = cover_colors(&img);
+        let bd_img = spicy_backdrop_image(&img);
+        self.insert_precomputed(ctx, key, img, bd_img, colors);
     }
 
     pub fn loading(&self) -> bool {

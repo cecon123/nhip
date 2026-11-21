@@ -117,6 +117,10 @@ impl Output {
         self.failed.load(Ordering::Relaxed)
     }
 
+    pub fn is_timer(&self) -> bool {
+        matches!(self._keepalive, Keepalive::Timer(_))
+    }
+
     pub fn push(&mut self, stereo: &[f32]) {
         for &s in stereo {
             let _ = self.producer.push(s);
@@ -129,7 +133,7 @@ impl Output {
         (p, c, frames)
     }
 
-    fn try_device(shared: Arc<Shared>) -> Option<Self> {
+    pub(super) fn try_device(shared: Arc<Shared>) -> Option<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
         let config = device.default_output_config().ok()?;

@@ -1138,17 +1138,34 @@ fn draw_preview_feed_modal(app: &mut App, ui: &mut Ui, full: Rect) {
         Pos2::new(scrub_x0, thumb_r.center().y - 10.0),
         Pos2::new(scrub_x1, thumb_r.center().y + 10.0),
     );
+    let scrub_id = top.scope_id().with("pf-scrubber");
     let scrub_resp = top
-        .interact(scrub_hit, top.scope_id().with("pf-scrubber"), Sense::click_and_drag())
+        .interact(scrub_hit, scrub_id, Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let dur_ms = app.duration_ms().max(cur.duration_ms).max(1);
-    let mut frac = (app.position_ms() as f32 / dur_ms as f32).clamp(0.0, 1.0);
-    if scrub_resp.clicked() || scrub_resp.dragged() {
+    let drag_key = scrub_id.with("drag-frac");
+    let mut drag_frac = top.ctx().data(|d| d.get_temp::<f32>(drag_key));
+    if scrub_resp.dragged() {
         if let Some(pos) = top.ctx().pointer_interact_pos() {
-            frac = ((pos.x - scrub_x0) / (scrub_x1 - scrub_x0).max(1.0)).clamp(0.0, 1.0);
-            app.actions.push(Action::SeekTo((frac * dur_ms as f32) as u64));
+            let f = ((pos.x - scrub_x0) / (scrub_x1 - scrub_x0).max(1.0)).clamp(0.0, 1.0);
+            drag_frac = Some(f);
+            top.ctx().data_mut(|d| d.insert_temp(drag_key, f));
         }
+    } else if scrub_resp.drag_stopped() {
+        if let Some(f) = drag_frac.take() {
+            top.ctx().data_mut(|d| d.remove::<f32>(drag_key));
+            app.actions.push(Action::SeekTo((f as f64 * dur_ms as f64) as u64));
+        }
+    } else if scrub_resp.clicked() {
+        if let Some(pos) = top.ctx().pointer_interact_pos() {
+            let f = ((pos.x - scrub_x0) / (scrub_x1 - scrub_x0).max(1.0)).clamp(0.0, 1.0);
+            app.actions.push(Action::SeekTo((f as f64 * dur_ms as f64) as u64));
+        }
+    } else if drag_frac.is_some() {
+        drag_frac = None;
+        top.ctx().data_mut(|d| d.remove::<f32>(drag_key));
     }
+    let frac = drag_frac.unwrap_or_else(|| (app.position_ms() as f32 / dur_ms as f32).clamp(0.0, 1.0));
     let bar_h = if scrub_resp.hovered() || scrub_resp.dragged() { 4.0 } else { 3.0 };
     let bar_rect = Rect::from_min_max(
         Pos2::new(scrub_x0, thumb_r.center().y - bar_h * 0.5),

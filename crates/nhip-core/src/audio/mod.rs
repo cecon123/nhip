@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dsp::{Equalizer, Limiter};
 use output::Output;
@@ -255,12 +255,20 @@ impl Deck {
     }
 
     fn open_with_cancel(spec: &LoadSpec, cancel: CancelSignal) -> Result<Self, String> {
+        Self::open_with_cancel_mode(spec, cancel, false)
+    }
+
+    fn open_with_cancel_mode(spec: &LoadSpec, cancel: CancelSignal, force_fresh: bool) -> Result<Self, String> {
         let src: Box<dyn Source> = match &spec.source {
             SourceSpec::File(path) => Box::new(FileSource::open(path)?),
             SourceSpec::Demo { seed, duration_ms } => Box::new(DemoSource::new(*seed, *duration_ms)),
             SourceSpec::YouTube { video_id } => {
-                let media = http_range::HttpRangeSource::open(video_id.clone(), cancel)
-                    .map_err(|e| e.to_string())?;
+                let media = if force_fresh {
+                    http_range::HttpRangeSource::open_fresh(video_id.clone(), cancel)
+                } else {
+                    http_range::HttpRangeSource::open(video_id.clone(), cancel)
+                }
+                .map_err(|e| e.to_string())?;
                 Box::new(FileSource::from_media_source(Box::new(media), Some("m4a"))?)
             }
         };
@@ -292,15 +300,15 @@ impl Deck {
         (d > 0).then(|| d.saturating_sub(self.position_ms()))
     }
 
-    fn seek(&mut self, ms: u64) {
-        if self.src.seek(ms) {
-            self.buf.clear();
-            self.frac = 0.0;
-            self.consumed = 0.0;
-            self.base_ms = ms;
-            self.ended = false;
-            self.tempo_map = None;
-        }
+    fn seek(&mut self, ms: u64) -> Option<u64> {
+        let actual_ms = self.src.seek(ms)?;
+        self.buf.clear();
+        self.frac = 0.0;
+        self.consumed = 0.0;
+        self.base_ms = actual_ms;
+        self.ended = false;
+        self.tempo_map = None;
+        Some(actual_ms)
     }
 
     /// Writes stereo frames resampled to `dev_rate`; returns how many frames were produced.
@@ -350,11 +358,16 @@ enum Pending {
 
 struct Worker<F: Fn()> {
     rx: Receiver<Cmd>,
+    pending_cmd: Option<Cmd>,
     tx: Sender<Event>,
     shared: Arc<Shared>,
     load_epoch: Arc<AtomicU64>,
     active_epoch: u64,
+    silent: bool,
     output: Output,
+    flush_waiting_since: Option<Instant>,
+    output_stalled_since: Option<Instant>,
+    last_device_retry: Instant,
     settings: AudioSettings,
     eq: Equalizer,
     limiter: Limiter,
@@ -396,11 +409,16 @@ impl<F: Fn()> Worker<F> {
         let limiter = Limiter::new(output.rate as f32);
         Self {
             rx,
+            pending_cmd: None,
             tx,
             shared,
             load_epoch,
             active_epoch: 0,
+            silent,
             output,
+            flush_waiting_since: None,
+            output_stalled_since: None,
+            last_device_retry: Instant::now(),
             settings,
             eq,
             limiter,
@@ -430,7 +448,114 @@ impl<F: Fn()> Worker<F> {
         self.pending.clear();
         if self.output.buffered_frames() != 0 {
             self.shared.flush_epoch.fetch_add(1, Ordering::Release);
+            self.flush_waiting_since = Some(Instant::now());
+        } else {
+            self.flush_waiting_since = None;
         }
+    }
+
+    fn rebuild_output(&mut self) {
+        self.output = if self.silent {
+            Output::timer(self.shared.clone())
+        } else {
+            Output::create(self.shared.clone())
+        };
+        self.flush_waiting_since = None;
+        self.output_stalled_since = None;
+        self.last_device_retry = Instant::now();
+        self.reconfigure_eq();
+        self.limiter.set_rate(self.output.rate as f32);
+    }
+
+    /// Detects and recovers from Windows WASAPI device switches, stalled audio callbacks,
+    /// or silent timer fallback when a hardware output device becomes available again.
+    fn check_output_health(&mut self) {
+        if self.output.failed() {
+            self.rebuild_output();
+            return;
+        }
+        if self.silent {
+            return;
+        }
+        if self.shared.waiting_for_flush() {
+            let since = *self.flush_waiting_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(250) {
+                self.rebuild_output();
+                return;
+            }
+        } else {
+            self.flush_waiting_since = None;
+        }
+
+        if self.current.is_some()
+            && !self.shared.is_paused()
+            && !self.shared.waiting_for_flush()
+            && self.output.free_frames() < BLOCK_FRAMES
+        {
+            let since = *self.output_stalled_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(600) {
+                self.rebuild_output();
+                return;
+            }
+        } else {
+            self.output_stalled_since = None;
+        }
+
+        if self.output.is_timer()
+            && !self.shared.is_paused()
+            && self.last_device_retry.elapsed() >= Duration::from_secs(2)
+        {
+            self.last_device_retry = Instant::now();
+            if let Some(dev) = Output::try_device(self.shared.clone()) {
+                self.output = dev;
+                self.flush_waiting_since = None;
+                self.output_stalled_since = None;
+                self.reconfigure_eq();
+                self.limiter.set_rate(self.output.rate as f32);
+            }
+        }
+    }
+
+    /// Pulls the next command, coalescing bursts of `Cmd::Seek` on the same track and dropping
+    /// already-superseded `Cmd::Load` commands so scrubbing/skipping never queues up HTTPS stalls.
+    fn next_command(&mut self) -> Result<Option<Cmd>, ()> {
+        let mut cmd = if let Some(c) = self.pending_cmd.take() {
+            Some(c)
+        } else if !self.can_render() {
+            match self.rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(c) => Some(c),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return Err(()),
+            }
+        } else {
+            self.rx.try_recv().ok()
+        };
+
+        while let Some(current) = cmd.take() {
+            match current {
+                Cmd::Load { epoch, .. } if epoch != self.load_epoch.load(Ordering::Acquire) => {
+                    // Superseded by a newer load before we even started; drain immediately.
+                    cmd = self.rx.try_recv().ok();
+                }
+                Cmd::Seek { id, mut ms } => {
+                    loop {
+                        match self.rx.try_recv() {
+                            Ok(Cmd::Seek { id: next_id, ms: next_ms }) if next_id == id => {
+                                ms = next_ms;
+                            }
+                            Ok(other) => {
+                                self.pending_cmd = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    return Ok(Some(Cmd::Seek { id, ms }));
+                }
+                other => return Ok(Some(other)),
+            }
+        }
+        Ok(None)
     }
 
     /// Announces decoder events once their audio is actually being heard. Reporting the end of a
@@ -457,25 +582,16 @@ impl<F: Fn()> Worker<F> {
         loop {
             self.deliver_pending();
             self.poll_preloaded_next();
-            let cmd = if !self.can_render() {
-                match self.rx.recv_timeout(Duration::from_millis(5)) {
-                    Ok(c) => Some(c),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            } else {
-                self.rx.try_recv().ok()
+            self.check_output_health();
+            let cmd = match self.next_command() {
+                Ok(c) => c,
+                Err(()) => return,
             };
             if let Some(cmd) = cmd {
                 if !self.handle(cmd) {
                     return;
                 }
                 continue;
-            }
-            if self.output.failed() {
-                self.output = Output::create(self.shared.clone());
-                self.reconfigure_eq();
-                self.limiter.set_rate(self.output.rate as f32);
             }
             if self.can_render() {
                 self.render_block();
@@ -638,11 +754,36 @@ impl<F: Fn()> Worker<F> {
                 }
                 self.flush_output();
                 self.outgoing = None;
+                let mut seek_failed_yt: Option<(TrackId, SourceSpec, f32, u64)> = None;
                 if let Some(d) = self.current.as_mut() {
-                    d.seek(ms);
-                    self.shared.position_ms.store(ms, Ordering::Relaxed);
+                    if let Some(actual_ms) = d.seek(ms) {
+                        self.shared.position_ms.store(actual_ms, Ordering::Relaxed);
+                    } else if matches!(d.spec, SourceSpec::YouTube { .. }) {
+                        seek_failed_yt = Some((d.id, d.spec.clone(), d.gain, d.src.duration_ms()));
+                    }
                 }
-                self.prepare_mix();
+                if let Some((deck_id, source, prev_gain, duration_ms)) = seek_failed_yt {
+                    let reopen_spec = LoadSpec {
+                        id: deck_id,
+                        source,
+                        duration_ms,
+                        gain_db: 0.0,
+                        transition: Transition::Gapless,
+                    };
+                    let cancel = CancelSignal::Epoch {
+                        current: self.load_epoch.clone(),
+                        expected: self.active_epoch,
+                    };
+                    if let Ok(mut fresh_deck) = Deck::open_with_cancel_mode(&reopen_spec, cancel, true) {
+                        fresh_deck.gain = prev_gain;
+                        let actual_ms = fresh_deck.seek(ms).unwrap_or(0);
+                        self.shared.position_ms.store(actual_ms, Ordering::Relaxed);
+                        self.set_current(Some(fresh_deck));
+                    }
+                }
+                if self.next.as_ref().is_some_and(|n| n.transition == Transition::AutoMix) {
+                    self.prepare_mix();
+                }
             }
             Cmd::Stop => {
                 self.flush_output();
@@ -1036,7 +1177,7 @@ mod tests {
         while src.fill(&mut out) {}
         assert!((out.len() as i64 - 2 * 3 * 44_100).abs() < 8192, "samples {}", out.len());
 
-        assert!(src.seek(2_000));
+        assert!(src.seek(2_000).is_some());
         out.clear();
         while src.fill(&mut out) {}
         assert!((out.len() as i64 - 2 * 44_100).abs() < 8192, "after seek {}", out.len());
@@ -1101,12 +1242,14 @@ mod http_range {
         }
     }
 
+    const MAX_STREAM_REFRESHES: u8 = 3;
+
     pub(crate) struct HttpRangeSource {
         agent: reqwest::blocking::Client,
         stream: ResolvedStream,
-        resolver: Box<dyn FnMut() -> Result<ResolvedStream, String> + Send + Sync>,
+        resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
         enforce_google_url: bool,
-        re_resolved: bool,
+        refreshes: u8,
         total_len: u64,
         pos: u64,
         cache: VecDeque<(u64, Vec<u8>)>,
@@ -1115,11 +1258,26 @@ mod http_range {
 
     impl HttpRangeSource {
         pub(crate) fn open(video_id: String, cancel: CancelSignal) -> io::Result<Self> {
+            Self::open_youtube(video_id, cancel, false)
+        }
+
+        pub(crate) fn open_fresh(video_id: String, cancel: CancelSignal) -> io::Result<Self> {
+            Self::open_youtube(video_id, cancel, true)
+        }
+
+        fn open_youtube(video_id: String, cancel: CancelSignal, initial_fresh: bool) -> io::Result<Self> {
             let agent = stream_http_agent().clone();
             Self::open_inner(
                 agent,
-                Box::new(move || crate::ytm::resolve_stream(&video_id)),
+                Box::new(move |fresh| {
+                    if fresh {
+                        crate::ytm::resolve_stream_fresh(&video_id)
+                    } else {
+                        crate::ytm::resolve_stream(&video_id)
+                    }
+                }),
                 true,
+                initial_fresh,
                 cancel,
             )
         }
@@ -1127,34 +1285,64 @@ mod http_range {
         #[cfg(test)]
         pub(crate) fn open_with_resolver(
             agent: reqwest::blocking::Client,
-            resolver: Box<dyn FnMut() -> Result<ResolvedStream, String> + Send + Sync>,
+            mut resolver: Box<dyn FnMut() -> Result<ResolvedStream, String> + Send + Sync>,
             cancel: CancelSignal,
         ) -> io::Result<Self> {
-            Self::open_inner(agent, resolver, false, cancel)
+            Self::open_inner(agent, Box::new(move |_fresh| resolver()), false, false, cancel)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn open_with_fresh_resolver(
+            agent: reqwest::blocking::Client,
+            resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
+            cancel: CancelSignal,
+        ) -> io::Result<Self> {
+            Self::open_inner(agent, resolver, false, false, cancel)
         }
 
         fn open_inner(
             agent: reqwest::blocking::Client,
-            mut resolver: Box<dyn FnMut() -> Result<ResolvedStream, String> + Send + Sync>,
+            mut resolver: Box<dyn FnMut(bool) -> Result<ResolvedStream, String> + Send + Sync>,
             enforce_google_url: bool,
+            initial_fresh: bool,
             cancel: CancelSignal,
         ) -> io::Result<Self> {
             if cancel.is_cancelled() {
                 return Err(RangeErr::Cancelled.into_io());
             }
-            let stream = resolver().map_err(io::Error::other)?;
+            let mut stream = resolver(initial_fresh).map_err(io::Error::other)?;
             if enforce_google_url && google_media_url(&stream.url).is_none() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "untrusted stream host"));
             }
-            let (total, first_chunk) = Self::fetch_full_range(
+            let mut refreshes = 0u8;
+            let (total, first_chunk) = match Self::fetch_full_range(
                 &agent,
                 &stream,
                 0,
                 (CHUNK_SIZE as u64) - 1,
                 None,
                 &cancel,
-            )
-            .map_err(RangeErr::into_io)?;
+            ) {
+                Ok(ok) => ok,
+                Err(RangeErr::AuthOrExpired(_)) if !initial_fresh => {
+                    // Cached stream URL expired before first chunk; force a fresh resolution once.
+                    stream = resolver(true).map_err(io::Error::other)?;
+                    if enforce_google_url && google_media_url(&stream.url).is_none() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "untrusted stream host"));
+                    }
+                    refreshes = 1;
+                    Self::fetch_full_range(
+                        &agent,
+                        &stream,
+                        0,
+                        (CHUNK_SIZE as u64) - 1,
+                        None,
+                        &cancel,
+                    )
+                    .map_err(RangeErr::into_io)?
+                }
+                Err(e) => return Err(e.into_io()),
+            };
 
             let mut cache = VecDeque::with_capacity(MAX_CACHED_CHUNKS);
             cache.push_back((0, first_chunk));
@@ -1164,7 +1352,7 @@ mod http_range {
                 stream,
                 resolver,
                 enforce_google_url,
-                re_resolved: false,
+                refreshes,
                 total_len: total,
                 pos: 0,
                 cache,
@@ -1298,11 +1486,11 @@ mod http_range {
             if self.cancel.is_cancelled() {
                 return Err(RangeErr::Cancelled.into_io());
             }
-            if self.re_resolved {
-                return Err(io::Error::other("stream already re-resolved once"));
+            if self.refreshes >= MAX_STREAM_REFRESHES {
+                return Err(io::Error::other("stream refresh limit reached"));
             }
-            self.re_resolved = true;
-            let next = (self.resolver)().map_err(io::Error::other)?;
+            self.refreshes += 1;
+            let next = (self.resolver)(true).map_err(io::Error::other)?;
             if self.enforce_google_url && google_media_url(&next.url).is_none() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "untrusted stream host"));
             }
@@ -1319,15 +1507,18 @@ mod http_range {
 
             let start = chunk_idx * CHUNK_SIZE as u64;
             let end = (start + CHUNK_SIZE as u64 - 1).min(self.total_len - 1);
+            let mut io_retries = 0u8;
+            let mut refreshed_this_chunk = false;
 
             let data = loop {
                 if self.cancel.is_cancelled() {
                     return Err(RangeErr::Cancelled.into_io());
                 }
                 if self.stream.expires_at.is_some_and(|exp| Instant::now() >= exp) {
-                    if self.re_resolved {
+                    if refreshed_this_chunk || self.refreshes >= MAX_STREAM_REFRESHES {
                         return Err(io::Error::other("stream URL expired after refresh"));
                     }
+                    refreshed_this_chunk = true;
                     self.refresh_stream()?;
                 }
                 match Self::fetch_full_range(
@@ -1339,8 +1530,14 @@ mod http_range {
                     &self.cancel,
                 ) {
                     Ok((_, data)) => break data,
-                    Err(RangeErr::AuthOrExpired(_)) if !self.re_resolved => {
+                    Err(RangeErr::AuthOrExpired(_))
+                        if !refreshed_this_chunk && self.refreshes < MAX_STREAM_REFRESHES =>
+                    {
+                        refreshed_this_chunk = true;
                         self.refresh_stream()?;
+                    }
+                    Err(RangeErr::Io(_)) if io_retries < 1 && !self.cancel.is_cancelled() => {
+                        io_retries += 1;
                     }
                     Err(e) => return Err(e.into_io()),
                 }
@@ -1574,14 +1771,14 @@ mod http_range {
             assert!(!out.is_empty());
 
             // Seek forward past 512 KiB (chunk 2) and decode.
-            assert!(file.seek(2_900));
+            assert!(file.seek(2_900).is_some());
             out.clear();
             assert!(file.fill(&mut out));
             assert!(!out.is_empty());
 
             // Seek backward into chunk 0 and verify cached/re-readable decode works.
             let hits_before_back_seek = hits.load(Ordering::Relaxed);
-            assert!(file.seek(200));
+            assert!(file.seek(200).is_some());
             out.clear();
             assert!(file.fill(&mut out));
             assert!(!out.is_empty());
@@ -1597,11 +1794,11 @@ mod http_range {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
-            let always_403_v2 = Arc::new(AtomicBool::new(false));
+            let always_403_after_v2 = Arc::new(AtomicBool::new(false));
 
             let srv_data = payload.clone();
             let srv_stop = stop.clone();
-            let srv_403_v2 = always_403_v2.clone();
+            let srv_403 = always_403_after_v2.clone();
             listener.set_nonblocking(true).unwrap();
             let server = thread::spawn(move || {
                 while !srv_stop.load(Ordering::Relaxed) {
@@ -1609,7 +1806,7 @@ mod http_range {
                         Ok((mut conn, _)) => {
                             let _ = conn.set_nonblocking(false);
                             if let Some((path, Some((s, e)))) = parse_http_request(&mut conn) {
-                                if (path == "/v1" && s > 0) || (path == "/v2" && srv_403_v2.load(Ordering::Relaxed)) {
+                                if (path == "/v1" && s > 0) || (path != "/v1" && srv_403.load(Ordering::Relaxed)) {
                                     let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                                 } else {
                                     send_206(&mut conn, &srv_data, s, e);
@@ -1651,15 +1848,110 @@ mod http_range {
             assert_eq!(&buf, &payload[CHUNK_SIZE..CHUNK_SIZE + 16]);
             assert_eq!(resolves.load(Ordering::Relaxed), 2);
 
-            // If refreshed stream ALSO returns 403 on chunk 2, it does not re-resolve a second time.
-            always_403_v2.store(true, Ordering::Relaxed);
+            // If chunk 2 returns 403 even after refreshing once for that chunk, fail cleanly without looping forever.
+            always_403_after_v2.store(true, Ordering::Relaxed);
             src.seek(SeekFrom::Start((CHUNK_SIZE * 2) as u64)).unwrap();
             let err = src.read(&mut buf).unwrap_err();
             assert!(err.to_string().contains("403"), "got {err}");
-            assert_eq!(resolves.load(Ordering::Relaxed), 2);
+            assert_eq!(resolves.load(Ordering::Relaxed), 3);
 
             stop.store(true, Ordering::Relaxed);
             let _ = server.join();
+        }
+
+        #[test]
+        fn http_range_forces_fresh_resolve_on_initial_403_and_midstream_403() {
+            let wav = Arc::new(make_test_wav(1.5));
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let srv_data = wav.clone();
+            let srv_stop = stop.clone();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                while !srv_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut conn, _)) => {
+                            let _ = conn.set_nonblocking(false);
+                            if let Some((path, Some((s, e)))) = parse_http_request(&mut conn) {
+                                if path == "/stale" {
+                                    let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                } else {
+                                    send_206(&mut conn, &srv_data, s, e);
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let fresh_calls = Arc::new(AtomicUsize::new(0));
+            let fc = fresh_calls.clone();
+            // Simulate a stale cached URL returning 403 on initial open: resolver(false) -> /stale, resolver(true) -> /fresh.
+            let src = HttpRangeSource::open_with_fresh_resolver(
+                test_agent(),
+                Box::new(move |fresh| {
+                    let path = if fresh {
+                        fc.fetch_add(1, Ordering::Relaxed);
+                        "/fresh"
+                    } else {
+                        "/stale"
+                    };
+                    Ok(ResolvedStream {
+                        itag: Some(140),
+                        url: format!("http://{addr}{path}"),
+                        headers: vec![],
+                        content_length: None,
+                        expires_at: Some(Instant::now() + Duration::from_secs(60)),
+                    })
+                }),
+                CancelSignal::Flag(Arc::new(AtomicBool::new(false))),
+            )
+            .unwrap();
+            assert_eq!(fresh_calls.load(Ordering::Relaxed), 1);
+
+            let mut file = FileSource::from_media_source(Box::new(src), Some("wav")).unwrap();
+            let mut out = VecDeque::new();
+            assert!(file.fill(&mut out));
+            assert!(!out.is_empty());
+
+            stop.store(true, Ordering::Relaxed);
+            let _ = server.join();
+        }
+
+        #[test]
+        fn engine_coalesces_seek_burst_to_latest_target() {
+            let engine = crate::audio::Engine::start_silent(
+                crate::audio::AudioSettings { crossfade_ms: 0, eq_enabled: false, eq_gains: [0.0; 6] },
+                || {},
+            );
+            let spec = crate::audio::LoadSpec {
+                id: 77,
+                source: crate::audio::SourceSpec::Demo { seed: 3, duration_ms: 30_000 },
+                duration_ms: 30_000,
+                gain_db: 0.0,
+                transition: crate::mechanics::Transition::Gapless,
+            };
+            engine.load(spec, 0, false);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !engine.has_song() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(engine.has_song());
+            for ms in [1_000, 3_000, 5_000, 9_000, 14_000] {
+                engine.seek(77, ms);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while engine.position_ms() < 13_500 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let pos = engine.position_ms();
+            assert!((13_500..=14_500).contains(&pos), "expected settled seek near 14000ms, got {pos}ms");
         }
 
         #[test]

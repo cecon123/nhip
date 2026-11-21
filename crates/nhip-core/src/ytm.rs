@@ -701,20 +701,40 @@ fn cache_stream(video_id: &str, stream: &ResolvedStream) {
     cache.insert(video_id.to_string(), (Instant::now(), stream.clone()));
 }
 
+fn evict_cached_stream(video_id: &str) {
+    let mut cache = stream_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.remove(video_id);
+}
+
 /// Resolves an unauthenticated AAC-LC audio stream via `VISIONOS/1.02` without logging URLs/tokens.
 /// Reuses a bounded 20-minute TTL cache so preloaded/replayed tracks avoid redundant Innertube calls.
 pub fn resolve_stream(video_id: &str) -> Result<ResolvedStream, String> {
+    resolve_stream_inner(video_id, false)
+}
+
+/// Bypasses and evicts any cached stream URL for `video_id` (used after HTTP 401/403/410 or seek recovery).
+pub fn resolve_stream_fresh(video_id: &str) -> Result<ResolvedStream, String> {
+    resolve_stream_inner(video_id, true)
+}
+
+fn resolve_stream_inner(video_id: &str, force_fresh: bool) -> Result<ResolvedStream, String> {
     if !valid_video_id(video_id) {
         return Err("invalid YouTube video id".to_string());
     }
-    if let Some(hit) = cached_stream(video_id) {
+    if force_fresh {
+        evict_cached_stream(video_id);
+    } else if let Some(hit) = cached_stream(video_id) {
         return Ok(hit);
     }
     let agent = stream_http_agent();
-    let cached_vd = visitor_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let cached_vd = if force_fresh {
+        None
+    } else {
+        visitor_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    };
     let vd = match cached_vd {
         Some(vd) => vd,
         None => {
