@@ -45,6 +45,10 @@ pub struct Track {
     pub mtime: u64,
     #[serde(default)]
     pub lyrics: Option<String>,
+    #[serde(default)]
+    pub spotify_id: Option<String>,
+    #[serde(default)]
+    pub isrc: Option<String>,
 }
 
 impl Track {
@@ -400,10 +404,63 @@ pub enum SurfaceStyle {
     /// Classic crisp dark Spotify chrome (`#000000` / `#121212`).
     #[default]
     Standard,
-    /// Soft live blurred album-art backdrop bleeding gently behind frosted translucent panels.
-    AmbientBlur,
-    /// Frosted Acrylic glass aesthetic with subtle cool specular border and deep tinted translucency.
+    /// Native Windows 11 Mica (`DWMSBT_MAINWINDOW`) matte wallpaper-tinted glass.
+    #[serde(alias = "AmbientBlur")]
+    Mica,
+    /// Native Windows 11 Mica Alt (`DWMSBT_TABBEDWINDOW`) richer wallpaper-tinted glass.
+    MicaAlt,
+    /// Native Windows 11 Acrylic (`DWMSBT_TRANSIENTWINDOW`) / Win10 blur-behind frosted glass.
     Acrylic,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccentTheme {
+    #[default]
+    SpotifyGreen,
+    OceanBlue,
+    Violet,
+    Rose,
+    Amber,
+    Mint,
+}
+
+impl AccentTheme {
+    pub const ALL: &'static [AccentTheme] = &[
+        AccentTheme::SpotifyGreen,
+        AccentTheme::OceanBlue,
+        AccentTheme::Violet,
+        AccentTheme::Rose,
+        AccentTheme::Amber,
+        AccentTheme::Mint,
+    ];
+
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            AccentTheme::SpotifyGreen => [0x1e, 0xd7, 0x60],
+            AccentTheme::OceanBlue => [0x3b, 0x82, 0xf6],
+            AccentTheme::Violet => [0xa8, 0x55, 0xf7],
+            AccentTheme::Rose => [0xf4, 0x3f, 0x5e],
+            AccentTheme::Amber => [0xf5, 0x9e, 0x0b],
+            AccentTheme::Mint => [0x14, 0xb8, 0xa6],
+        }
+    }
+
+    pub fn label(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (AccentTheme::SpotifyGreen, Lang::Vi) => "Xanh lá (Mặc định)",
+            (AccentTheme::SpotifyGreen, Lang::En) => "Green (Default)",
+            (AccentTheme::OceanBlue, Lang::Vi) => "Xanh dương",
+            (AccentTheme::OceanBlue, Lang::En) => "Ocean Blue",
+            (AccentTheme::Violet, Lang::Vi) => "Tím",
+            (AccentTheme::Violet, Lang::En) => "Violet",
+            (AccentTheme::Rose, Lang::Vi) => "Hồng đỏ",
+            (AccentTheme::Rose, Lang::En) => "Rose",
+            (AccentTheme::Amber, Lang::Vi) => "Hổ phách",
+            (AccentTheme::Amber, Lang::En) => "Amber",
+            (AccentTheme::Mint, Lang::Vi) => "Xanh ngọc",
+            (AccentTheme::Mint, Lang::En) => "Mint",
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -439,6 +496,21 @@ pub struct Settings {
     pub miniplayer_size: Option<[f32; 2]>,
     pub miniplayer_cover_mode: bool,
     pub surface_style: SurfaceStyle,
+    /// Backdrop tint opacity (`0.0..=0.95`) over Windows Acrylic / Mica.
+    pub surface_opacity: f32,
+    /// Translucent card/panel opacity (`0.10..=0.95`) over the window surface.
+    pub panel_opacity: f32,
+    /// Album-art ambient color tint strength (`0.0..=1.0`) blended over translucent surfaces.
+    pub surface_tint_strength: f32,
+    /// User-customized local profile display name.
+    pub profile_name: String,
+    /// Personalized accent color theme.
+    pub accent_theme: AccentTheme,
+    /// Whether Home recommendations and Heavy Rotation shelves personalize to local listening habits.
+    pub personalize_home: bool,
+    pub spicy_lyrics_enabled: bool,
+    pub spicy_lyrics_api_key: String,
+    pub spicy_lyrics_api_url: String,
 }
 
 impl Default for Settings {
@@ -474,6 +546,15 @@ impl Default for Settings {
             miniplayer_size: None,
             miniplayer_cover_mode: false,
             surface_style: SurfaceStyle::Standard,
+            surface_opacity: 0.62,
+            panel_opacity: 0.64,
+            surface_tint_strength: 0.28,
+            profile_name: "Nhịp".to_string(),
+            accent_theme: AccentTheme::SpotifyGreen,
+            personalize_home: true,
+            spicy_lyrics_enabled: true,
+            spicy_lyrics_api_key: String::new(),
+            spicy_lyrics_api_url: String::new(),
         }
     }
 }
@@ -612,9 +693,19 @@ where
     Ok(out)
 }
 
+pub const USER_SCHEMA_VERSION: u32 = 2;
+const MAX_LISTENING_HISTORY: usize = 200;
+const MAX_UNREFERENCED_YT_CACHE: usize = 1_500;
+
+fn default_schema_version() -> u32 {
+    USER_SCHEMA_VERSION
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UserData {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub playlists: Vec<Playlist>,
     #[serde(default, deserialize_with = "deserialize_folders")]
     pub folders: Vec<PlaylistFolder>,
@@ -641,6 +732,7 @@ pub struct UserData {
 impl Default for UserData {
     fn default() -> Self {
         Self {
+            schema_version: USER_SCHEMA_VERSION,
             playlists: Vec::new(),
             folders: Vec::new(),
             followed_ytm: Vec::new(),
@@ -665,7 +757,36 @@ impl UserData {
     pub fn record_listen(&mut self, id: TrackId) {
         self.listening_history.retain(|&entry| entry != id);
         self.listening_history.insert(0, id);
-        self.listening_history.truncate(50);
+        self.listening_history.truncate(MAX_LISTENING_HISTORY);
+    }
+
+    pub fn clear_taste_history(&mut self) {
+        self.listening_history.clear();
+        self.play_counts.clear();
+        self.skip_counts.clear();
+        self.recent_searches.clear();
+    }
+
+    pub fn total_completed_plays(&self) -> u64 {
+        self.play_counts.values().map(|&v| v as u64).sum()
+    }
+
+    /// Returns the user's most played non-hidden tracks present in `lib`, ranked by plays minus fast skips.
+    pub fn top_played_tracks(&self, lib: &Library, limit: usize) -> Vec<TrackId> {
+        let mut ranked: Vec<(i64, u32, TrackId)> = self
+            .play_counts
+            .iter()
+            .filter(|(&id, &plays)| {
+                plays > 0 && !self.hidden_tracks.contains(&id) && lib.tracks.contains_key(&id)
+            })
+            .map(|(&id, &plays)| {
+                let skips = self.skip_counts.get(&id).copied().unwrap_or(0);
+                let score = (plays as i64) * 3 - (skips as i64) * 2;
+                (score, plays, id)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+        ranked.into_iter().take(limit).map(|(_, _, id)| id).collect()
     }
 
     pub fn is_liked(&self, id: TrackId) -> bool {
@@ -921,6 +1042,12 @@ fn library_file() -> PathBuf {
     data_dir().join("youtube-music-library.json")
 }
 
+fn user_backup_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".bak");
+    PathBuf::from(os)
+}
+
 fn read_user(path: &Path) -> io::Result<UserData> {
     serde_json::from_slice(&std::fs::read(path)?).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
@@ -928,6 +1055,11 @@ fn read_user(path: &Path) -> io::Result<UserData> {
 fn load_user_at(path: &Path, legacy: &Path) -> io::Result<UserData> {
     match read_user(path) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // If primary is absent but a rolling `.bak` exists (e.g. crash mid-replace), recover from `.bak`.
+            let bak = user_backup_path(path);
+            if let Ok(recovered) = read_user(&bak) {
+                return Ok(recovered);
+            }
             let mut data = UserData::default();
             if path != legacy {
                 if let Ok(old) = read_user(legacy) {
@@ -935,6 +1067,16 @@ fn load_user_at(path: &Path, legacy: &Path) -> io::Result<UserData> {
                 }
             }
             Ok(data)
+        }
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+            let bak = user_backup_path(path);
+            if let Ok(recovered) = read_user(&bak) {
+                // Quarantine the corrupt primary file so the user can inspect it without losing data.
+                let quarantine = path.with_extension(format!("corrupt-{}", now()));
+                let _ = std::fs::rename(path, quarantine);
+                return Ok(recovered);
+            }
+            Err(err)
         }
         result => result,
     }
@@ -952,15 +1094,44 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = std::fs::File::create_new(&tmp)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    let result = written.and_then(|()| {
+        // Bounded retry on Windows where AV/search indexers transiently hold the target file.
+        let mut last_err = None;
+        for attempt in 0..5 {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied && attempt < 4 => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(15 * (attempt as u64 + 1)));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "rename failed")))
+    });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
 }
 
+fn save_user_at(path: &Path, data: &UserData) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(data)?;
+    // Keep a rolling `.bak` copy of the last valid on-disk file before replacing it.
+    if let Ok(prev) = std::fs::read(path) {
+        if serde_json::from_slice::<serde_json::Value>(&prev).is_ok() {
+            let _ = write_atomic(&user_backup_path(path), &prev);
+        }
+    }
+    write_atomic(path, &bytes)
+}
+
 pub fn save_user(data: &UserData) -> std::io::Result<()> {
-    write_atomic(&user_file(), &serde_json::to_vec_pretty(data)?)
+    save_user_at(&user_file(), data)
+}
+
+pub fn export_user_backup(destination: &Path, data: &UserData) -> io::Result<()> {
+    write_atomic(destination, &serde_json::to_vec_pretty(data)?)
 }
 
 pub fn load_library_cache() -> Vec<Track> {
@@ -973,6 +1144,85 @@ pub fn load_library_cache() -> Vec<Track> {
 pub fn save_library_cache(lib: &Library) -> std::io::Result<()> {
     let tracks: Vec<&Track> = lib.tracks.values().map(|t| t.as_ref()).filter(|t| t.youtube_id().is_some()).collect();
     write_atomic(&library_file(), &serde_json::to_vec(&tracks)?)
+}
+
+/// Saves cached YouTube Music tracks while pruning unbounded unreferenced entries (> `1,500`)
+/// and unconditionally preserving every track referenced by likes, playlists, history, play counts, or active session.
+pub fn save_library_cache_pruned(lib: &Library, data: &UserData) -> io::Result<()> {
+    let tracks = select_cached_tracks(lib, data, MAX_UNREFERENCED_YT_CACHE);
+    write_atomic(&library_file(), &serde_json::to_vec(&tracks)?)
+}
+
+fn select_cached_tracks<'a>(lib: &'a Library, data: &UserData, max_unreferenced: usize) -> Vec<&'a Track> {
+    let mut keep_ids = std::collections::HashSet::new();
+    for entry in &data.liked {
+        keep_ids.insert(entry.id);
+    }
+    for pl in &data.playlists {
+        for entry in &pl.tracks {
+            keep_ids.insert(entry.id);
+        }
+    }
+    for &id in &data.listening_history {
+        keep_ids.insert(id);
+    }
+    for (&id, &plays) in &data.play_counts {
+        if plays > 0 {
+            keep_ids.insert(id);
+        }
+    }
+    if let Some(cur) = data.session.current {
+        keep_ids.insert(cur);
+    }
+    for &id in &data.session.context {
+        keep_ids.insert(id);
+    }
+
+    let mut pinned = Vec::new();
+    let mut transient = Vec::new();
+    for track in lib.tracks.values().map(|t| t.as_ref()) {
+        if track.youtube_id().is_none() {
+            continue;
+        }
+        if keep_ids.contains(&track.id) {
+            pinned.push(track);
+        } else {
+            transient.push(track);
+        }
+    }
+    if transient.len() > max_unreferenced {
+        transient.sort_by(|a, b| b.added.cmp(&a.added).then_with(|| a.id.cmp(&b.id)));
+        transient.truncate(max_unreferenced);
+    }
+    pinned.extend(transient);
+    pinned
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LocalDbStats {
+    pub user_bytes: u64,
+    pub library_bytes: u64,
+    pub has_backup: bool,
+    pub cached_yt_tracks: usize,
+    pub playlists_count: usize,
+    pub liked_count: usize,
+    pub history_count: usize,
+    pub total_plays: u64,
+}
+
+pub fn local_db_stats(lib: &Library, data: &UserData) -> LocalDbStats {
+    let uf = user_file();
+    let lf = library_file();
+    LocalDbStats {
+        user_bytes: std::fs::metadata(&uf).map(|m| m.len()).unwrap_or(0),
+        library_bytes: std::fs::metadata(&lf).map(|m| m.len()).unwrap_or(0),
+        has_backup: user_backup_path(&uf).is_file(),
+        cached_yt_tracks: lib.tracks.values().filter(|t| t.youtube_id().is_some()).count(),
+        playlists_count: data.playlists.len() + data.followed_ytm.len(),
+        liked_count: data.liked.len(),
+        history_count: data.listening_history.len(),
+        total_plays: data.total_completed_plays(),
+    }
 }
 
 pub fn imported_lyrics_file(track: &Track) -> PathBuf {
@@ -1044,6 +1294,8 @@ pub fn demo_tracks() -> Vec<Track> {
                 added: now().saturating_sub(i as u64 * 86_400),
                 mtime: 0,
                 lyrics: None,
+                spotify_id: None,
+                isrc: None,
             }
         })
         .collect()
@@ -1088,12 +1340,12 @@ mod tests {
     #[test]
     fn history_moves_replayed_songs_to_the_front_and_caps_size() {
         let mut data = UserData::default();
-        for id in 0..55 {
+        for id in 0..205 {
             data.record_listen(id);
         }
         data.record_listen(17);
-        assert_eq!(&data.listening_history[..3], &[17, 54, 53]);
-        assert_eq!(data.listening_history.len(), 50);
+        assert_eq!(&data.listening_history[..3], &[17, 204, 203]);
+        assert_eq!(data.listening_history.len(), MAX_LISTENING_HISTORY);
         assert_eq!(data.listening_history.iter().filter(|&&id| id == 17).count(), 1);
     }
 
@@ -1350,12 +1602,64 @@ mod tests {
             "playlists": [],
             "liked": [],
             "recent_searches": ["thắng"],
-            "settings": { "lang": "Vi", "volume": 0.42, "spotify_client_id": "" }
+            "settings": { "lang": "Vi", "volume": 0.42, "surface_style": "AmbientBlur", "spotify_client_id": "" }
         }"#;
         let parsed: UserData = serde_json::from_str(legacy).expect("legacy user.json must deserialize");
         assert!(parsed.folders.is_empty());
         assert_eq!(parsed.recent_searches, vec!["thắng"]);
         assert!((parsed.settings.volume - 0.42).abs() < 1e-4);
-        assert_eq!(parsed.settings.surface_style, SurfaceStyle::Standard);
+        assert_eq!(parsed.settings.surface_style, SurfaceStyle::Mica);
+    }
+
+    #[test]
+    fn corrupt_user_json_recovers_automatically_from_rolling_backup() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("nhip-bak-{}-{}", std::process::id(), rand::random::<u64>()));
+        let user_path = dir.join("user.json");
+        let mut v1 = UserData::default();
+        v1.settings.profile_name = "Minh".into();
+        v1.toggle_like(9001);
+        save_user_at(&user_path, &v1)?;
+
+        // Second save creates `user.json.bak` containing v1.
+        let mut v2 = v1.clone();
+        v2.settings.profile_name = "Minh Pro".into();
+        save_user_at(&user_path, &v2)?;
+        assert!(user_backup_path(&user_path).is_file());
+
+        // Simulate corrupt primary `user.json`.
+        write_atomic(&user_path, b"{truncated_corrupt_json")?;
+        let recovered = load_user_at(&user_path, &user_path)?;
+        assert_eq!(recovered.settings.profile_name, "Minh");
+        assert!(recovered.is_liked(9001));
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn pruned_library_cache_preserves_referenced_tracks_and_caps_unreferenced() {
+        let mut tracks = Vec::new();
+        for i in 0..10u64 {
+            let vid = format!("vid{i:08}");
+            let mut t = demo_tracks().remove(0);
+            t.id = fnv(&format!("yt:{vid}"));
+            t.path = format!("yt:{vid}");
+            t.added = 100 + i;
+            tracks.push(t);
+        }
+        let lib = Library::new(tracks.clone());
+        let mut data = UserData::default();
+        data.toggle_like(tracks[0].id); // oldest track is liked -> MUST stay!
+        data.record_play_complete(tracks[1].id); // played -> MUST stay!
+
+        let kept = select_cached_tracks(&lib, &data, 3);
+        let kept_ids: std::collections::HashSet<TrackId> = kept.iter().map(|t| t.id).collect();
+        assert_eq!(kept.len(), 5); // 2 referenced + 3 newest unreferenced
+        assert!(kept_ids.contains(&tracks[0].id));
+        assert!(kept_ids.contains(&tracks[1].id));
+        assert!(kept_ids.contains(&tracks[9].id));
+        assert!(kept_ids.contains(&tracks[8].id));
+        assert!(kept_ids.contains(&tracks[7].id));
+        assert!(!kept_ids.contains(&tracks[2].id));
     }
 }

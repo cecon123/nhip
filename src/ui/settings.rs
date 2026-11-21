@@ -8,7 +8,7 @@ use eframe::egui::{
 use super::icons::{self, Icon};
 use super::widgets::*;
 use crate::app::{Action, App};
-use crate::library::{data_dir, fold, Lang, NormLevel, SurfaceStyle};
+use crate::library::{data_dir, fold, local_db_stats, AccentTheme, Lang, NormLevel, SurfaceStyle};
 use crate::mechanics::{CROSSFADE_MAX_S, EQ_BANDS, EQ_PRESETS, EQ_RANGE_DB};
 use crate::theme::*;
 
@@ -70,7 +70,10 @@ fn spotify_select<T: PartialEq + Copy + 'static>(
     current: &mut T,
 ) -> bool {
     let enabled = ui.is_enabled();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), if enabled { Sense::click() } else { Sense::hover() });
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), if enabled { Sense::click() } else { Sense::hover() });
+    if enabled {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
     let fill = if !enabled {
         ELEVATED.linear_multiply(0.5)
     } else if resp.hovered() {
@@ -104,33 +107,42 @@ fn spotify_select<T: PartialEq + Copy + 'static>(
     let mut changed = false;
     if enabled {
         let popup_id = ui.make_persistent_id(id);
-        if resp.clicked() {
-            egui::Popup::toggle_id(ui.ctx(), popup_id);
-        }
+        let max_label_w = items
+            .iter()
+            .map(|(_, label)| text_width(ui, label, body(13.0)))
+            .fold(0.0_f32, f32::max);
+        let inner_w = (max_label_w + 38.0).clamp((width - 6.0).max(140.0), 232.0);
+        // NOTE: `Popup::from_toggle_button_response` toggles `popup_id` internally on `resp.clicked()`.
+        // Never call `Popup::toggle_id` manually here or clicks double-toggle open->closed on the same frame!
         egui::Popup::from_toggle_button_response(&resp)
             .id(popup_id)
-            .frame(popup_frame(ui.style()))
+            .align(egui::RectAlign::BOTTOM_END)
+            .width(inner_w + 6.0)
+            .frame(menu_frame(ui.style()))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                ui.set_min_width((width - 16.0).max(150.0));
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_min_width(inner_w);
+                ui.set_max_width(inner_w);
                 for &(val, label) in items {
                     let active = *current == val;
-                    let rw = ui.available_width();
-                    let (ir, iresp) = ui.allocate_exact_size(Vec2::new(rw, 32.0), Sense::click());
+                    let rw = inner_w;
+                    let (ir, iresp) = ui.allocate_exact_size(Vec2::new(rw, 27.0), Sense::click());
+                    let iresp = iresp.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if iresp.hovered() {
                         ui.painter().rect_filled(ir, RADIUS_SMALLER, Color32::from_white_alpha(25));
                     }
                     text(
                         ui.painter(),
-                        Pos2::new(ir.left() + 10.0, ir.center().y),
+                        Pos2::new(ir.left() + 8.0, ir.center().y),
                         label,
-                        body_small(),
+                        body(13.0),
                         if active { ACCENT } else { TEXT },
-                        rw - 34.0,
+                        rw - 28.0,
                         Align2::LEFT_CENTER,
                     );
                     if active {
-                        let cr = Rect::from_center_size(Pos2::new(ir.right() - 14.0, ir.center().y), Vec2::splat(14.0));
+                        let cr = Rect::from_center_size(Pos2::new(ir.right() - 12.0, ir.center().y), Vec2::splat(13.0));
                         icons::paint(ui.painter(), cr, Icon::Checkmark, ACCENT);
                     }
                     if iresp.clicked() {
@@ -433,12 +445,14 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
             if show_sf {
                 pref_row(ui, col_w, sf_title, sf_desc, |ui| {
                     let lbl_std = t("Mặc định (Tối)", "Standard (Dark)");
-                    let lbl_blur = t("Mờ ảnh bìa (Blur)", "Ambient Blur");
-                    let lbl_acrylic = t("Kính mờ (Acrylic)", "Frosted Acrylic");
+                    let lbl_acrylic = t("Windows Acrylic (Kính mờ)", "Windows Acrylic");
+                    let lbl_mica = "Windows Mica";
+                    let lbl_mica_alt = "Windows Mica Alt";
                     let cur_lbl = match s.surface_style {
                         SurfaceStyle::Standard => lbl_std,
-                        SurfaceStyle::AmbientBlur => lbl_blur,
                         SurfaceStyle::Acrylic => lbl_acrylic,
+                        SurfaceStyle::Mica => lbl_mica,
+                        SurfaceStyle::MicaAlt => lbl_mica_alt,
                     };
                     changed |= spotify_select(
                         ui,
@@ -447,12 +461,65 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
                         196.0,
                         &[
                             (SurfaceStyle::Standard, lbl_std),
-                            (SurfaceStyle::AmbientBlur, lbl_blur),
                             (SurfaceStyle::Acrylic, lbl_acrylic),
+                            (SurfaceStyle::Mica, lbl_mica),
+                            (SurfaceStyle::MicaAlt, lbl_mica_alt),
                         ],
                         &mut s.surface_style,
                     );
                 });
+                if s.surface_style != SurfaceStyle::Standard {
+                    let op_title = t("Mức độ đục nền (Backdrop)", "Backdrop tint intensity");
+                    let op_desc = t(
+                        "0% = trong suốt tối đa theo Mica/Acrylic, 95% = nền tối sâu dễ đọc.",
+                        "0% = clearest native Mica/Acrylic glass, 95% = deep dark smoked tint.",
+                    );
+                    pref_row(ui, col_w, op_title, op_desc, |ui| {
+                        let mut pct = (s.surface_opacity.clamp(0.0, 0.95) * 100.0).round() as u32;
+                        ui.label(RichText::new(format!("{pct}%")).font(marginal()).color(SUBTLE));
+                        let sl = Slider::new(&mut pct, 0..=95).show_value(false);
+                        if ui.add_sized(Vec2::new(136.0, 22.0), sl).changed() {
+                            s.surface_opacity = (pct as f32 / 100.0).clamp(0.0, 0.95);
+                            changed = true;
+                        }
+                    });
+
+                    let panel_title = t("Mức độ mờ khung bảng (Panels)", "Panel translucency");
+                    let panel_desc = t(
+                        "Điều chỉnh độ đậm nhạt của thanh Thư viện, nội dung chính và bảng Đang phát.",
+                        "Adjust frosted glass opacity of the Library, main canvas, and Now Playing panels.",
+                    );
+                    pref_row(ui, col_w, panel_title, panel_desc, |ui| {
+                        let mut pct = (s.panel_opacity.clamp(0.10, 0.95) * 100.0).round() as u32;
+                        ui.label(RichText::new(format!("{pct}%")).font(marginal()).color(SUBTLE));
+                        let sl = Slider::new(&mut pct, 10..=95).show_value(false);
+                        if ui.add_sized(Vec2::new(136.0, 22.0), sl).changed() {
+                            s.panel_opacity = (pct as f32 / 100.0).clamp(0.10, 0.95);
+                            changed = true;
+                        }
+                    });
+
+                    let tint_title = t("Ánh màu bìa bài hát", "Album-art ambient tint");
+                    let tint_desc = t(
+                        "Pha nhẹ tông màu bìa bài đang phát lên lớp kính Mica/Acrylic (0% = thuần Windows).",
+                        "Blend subtle album-cover ambient color into Mica/Acrylic (0% = pure Windows backdrop).",
+                    );
+                    pref_row(ui, col_w, tint_title, tint_desc, |ui| {
+                        let mut pct = (s.surface_tint_strength.clamp(0.0, 1.0) * 100.0).round() as u32;
+                        if outline_button(ui, t("Mặc định", "Reset")).clicked() {
+                            s.surface_opacity = 0.62;
+                            s.panel_opacity = 0.64;
+                            s.surface_tint_strength = 0.28;
+                            changed = true;
+                        }
+                        ui.label(RichText::new(format!("{pct}%")).font(marginal()).color(SUBTLE));
+                        let sl = Slider::new(&mut pct, 0..=100).show_value(false);
+                        if ui.add_sized(Vec2::new(104.0, 22.0), sl).changed() {
+                            s.surface_tint_strength = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                            changed = true;
+                        }
+                    });
+                }
             }
             if show_ct {
                 pref_row(ui, col_w, ct_title, ct_desc, |ui| {
@@ -472,6 +539,161 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
             if show_rt {
                 pref_row(ui, col_w, rt_title, rt_desc, |ui| {
                     changed |= toggle_switch(ui, &mut s.show_remaining_time);
+                });
+            }
+        }
+    }
+
+    // 5b. Lyrics Provider (Spicy Lyrics API first, then fallback providers)
+    {
+        let sec = t("Lời bài hát", "Lyrics");
+        let en_title = t("Ưu tiên Spicy Lyrics API", "Prioritize Spicy Lyrics API");
+        let en_desc = t(
+            "Dùng Spicy Lyrics API làm nguồn đầu tiên khi có khóa API hoặc proxy, sau đó tự động chuyển về nguồn dự phòng.",
+            "Query Spicy Lyrics API first when an API key or proxy is configured, then fall back to existing providers.",
+        );
+        let key_title = t("Khóa API công khai (Publishable Key)", "Publishable API key");
+        let key_desc = t(
+            "Dùng khóa sl_pk_… hoặc biến môi trường SPICY_LYRICS_API_KEY. Không nhúng khóa bí mật vào ứng dụng.",
+            "Provide an sl_pk_… key or set SPICY_LYRICS_API_KEY. Never embed private server keys in the client.",
+        );
+        let url_title = t("Địa chỉ API / Proxy tùy chọn", "Custom API / proxy URL");
+        let url_desc = t(
+            "Để trống để dùng https://api.spicylyrics.org, hoặc trỏ tới backend proxy giữ khóa bí mật.",
+            "Leave empty for https://api.spicylyrics.org, or point to your backend proxy holding a secret key.",
+        );
+
+        let show_en = matches_query(&query, sec, en_title, en_desc);
+        let show_key = matches_query(&query, sec, key_title, key_desc);
+        let show_url = matches_query(&query, sec, url_title, url_desc);
+        if show_en || show_key || show_url {
+            matched_any = true;
+            section_header(ui, sec);
+            let s = &mut app.data.settings;
+            if show_en {
+                pref_row(ui, col_w, en_title, en_desc, |ui| {
+                    changed |= toggle_switch(ui, &mut s.spicy_lyrics_enabled);
+                });
+            }
+            let api_enabled = s.spicy_lyrics_enabled;
+            if show_key {
+                pref_row(ui, col_w, key_title, key_desc, |ui| {
+                    ui.add_enabled_ui(api_enabled, |ui| {
+                        let w = ui.available_width().clamp(140.0, 220.0);
+                        let resp = ui.add(
+                            TextEdit::singleline(&mut s.spicy_lyrics_api_key)
+                                .password(true)
+                                .hint_text("sl_pk_…")
+                                .desired_width(w),
+                        );
+                        changed |= resp.changed();
+                    });
+                });
+            }
+            if show_url {
+                pref_row(ui, col_w, url_title, url_desc, |ui| {
+                    ui.add_enabled_ui(api_enabled, |ui| {
+                        let w = ui.available_width().clamp(140.0, 220.0);
+                        let resp = ui.add(
+                            TextEdit::singleline(&mut s.spicy_lyrics_api_url)
+                                .hint_text("https://api.spicylyrics.org")
+                                .desired_width(w),
+                        );
+                        changed |= resp.changed();
+                    });
+                });
+            }
+        }
+    }
+
+    // 5c. Personalization (Profile name, accent theme, personalized Home, taste reset)
+    {
+        let sec = t("Cá nhân hóa", "Personalization");
+        let name_title = t("Tên hiển thị hồ sơ", "Profile display name");
+        let name_desc = t(
+            "Hiển thị trên avatar góc phải, trang Hồ sơ và mục gợi ý Dành riêng cho bạn.",
+            "Shown on your avatar badge, Profile header, and personalized Home shelves.",
+        );
+        let acc_title = t("Màu nhấn cá nhân", "Accent color");
+        let acc_desc = t(
+            "Tùy chỉnh tông màu chủ đạo cho hồ sơ và các điểm nhấn giao diện.",
+            "Customize your personal accent tint for profile avatar and highlights.",
+        );
+        let home_title = t("Cá nhân hóa Trang chủ", "Personalize Home feed");
+        let home_desc = t(
+            "Ưu tiên gợi ý theo lịch sử nghe, nghệ sĩ yêu thích và mục Nghe nhiều nhất.",
+            "Rank Home recommendations from your local listening history, likes, and heavy rotation.",
+        );
+        let reset_title = t("Đặt lại gu âm nhạc cục bộ", "Reset local listening taste");
+        let reset_desc = t(
+            "Xóa lịch sử nghe, lượt phát, lượt bỏ qua và tìm kiếm gần đây (giữ nguyên Playlist & Bài đã thích).",
+            "Clear listening history, play/skip counts, and recent searches (keeps playlists & likes).",
+        );
+
+        let show_name = matches_query(&query, sec, name_title, name_desc);
+        let show_acc = matches_query(&query, sec, acc_title, acc_desc);
+        let show_home = matches_query(&query, sec, home_title, home_desc);
+        let show_reset = matches_query(&query, sec, reset_title, reset_desc);
+        if show_name || show_acc || show_home || show_reset {
+            matched_any = true;
+            section_header(ui, sec);
+            if show_name {
+                let s = &mut app.data.settings;
+                pref_row(ui, col_w, name_title, name_desc, |ui| {
+                    let w = ui.available_width().clamp(140.0, 200.0);
+                    let resp = ui.add(
+                        TextEdit::singleline(&mut s.profile_name)
+                            .char_limit(32)
+                            .hint_text("Nhịp")
+                            .desired_width(w),
+                    );
+                    changed |= resp.changed();
+                });
+            }
+            if show_acc {
+                let s = &mut app.data.settings;
+                pref_row(ui, col_w, acc_title, acc_desc, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for &theme in AccentTheme::ALL.iter().rev() {
+                            let col = accent_color(theme);
+                            let selected = s.accent_theme == theme;
+                            let (r, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                            let resp = resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(theme.label(current_lang));
+                            ui.painter().circle_filled(r.center(), if selected { 9.0 } else { 8.0 }, col);
+                            if selected {
+                                ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(1.5, TEXT));
+                            } else if resp.hovered() {
+                                ui.painter().circle_stroke(r.center(), 10.0, Stroke::new(1.0, SUBTLE));
+                            }
+                            if resp.clicked() && !selected {
+                                s.accent_theme = theme;
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+            }
+            if show_home {
+                let s = &mut app.data.settings;
+                pref_row(ui, col_w, home_title, home_desc, |ui| {
+                    changed |= toggle_switch(ui, &mut s.personalize_home);
+                });
+            }
+            if show_reset {
+                let has_history = !app.data.listening_history.is_empty()
+                    || !app.data.play_counts.is_empty()
+                    || !app.data.recent_searches.is_empty();
+                pref_row(ui, col_w, reset_title, reset_desc, |ui| {
+                    if ui
+                        .add_enabled_ui(has_history, |ui| outline_button(ui, t("Đặt lại", "Reset")))
+                        .inner
+                        .clicked()
+                    {
+                        app.actions.push(Action::ClearTasteHistory);
+                    }
                 });
             }
         }
@@ -508,9 +730,9 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
         }
     }
 
-    // 7. Storage (Portable Storage location)
+    // 7. Storage & Local Database Health
     {
-        let sec = t("Lưu trữ", "Storage");
+        let sec = t("Lưu trữ & Cơ sở dữ liệu cục bộ", "Storage & Local Database");
         let st_title = t("Vị trí lưu trữ dữ liệu (Portable / AppData)", "Offline & Portable storage location");
         let path_str = data_dir().display().to_string();
         let is_portable = std::env::current_exe()
@@ -523,14 +745,44 @@ fn content(app: &mut App, ui: &mut Ui, col_w: f32) {
             t("Thư mục dữ liệu chuẩn của người dùng", "Standard user data directory")
         };
         let st_desc = format!("{mode_note}: {path_str}");
-        if matches_query(&query, sec, st_title, &st_desc) {
+
+        let db_title = t("Trạng thái cơ sở dữ liệu cục bộ", "Local database health");
+        let stats = local_db_stats(&app.lib, &app.data);
+        let total_kb = (stats.user_bytes + stats.library_bytes).div_ceil(1024);
+        let bak_note = if stats.has_backup {
+            t("có bản dự phòng .bak", ".bak backup ready")
+        } else {
+            t("tự tạo .bak khi lưu", "auto .bak on save")
+        };
+        let db_desc = format!(
+            "{} {} • {} {} • {} {} • ~{total_kb} KB ({bak_note})",
+            stats.liked_count,
+            t("bài đã thích", "likes"),
+            stats.playlists_count,
+            t("playlist", "playlists"),
+            stats.cached_yt_tracks,
+            t("bài đã lưu đệm", "cached tracks"),
+        );
+
+        let show_st = matches_query(&query, sec, st_title, &st_desc);
+        let show_db = matches_query(&query, sec, db_title, &db_desc);
+        if show_st || show_db {
             matched_any = true;
             section_header(ui, sec);
-            pref_row(ui, col_w, st_title, &st_desc, |ui| {
-                if outline_button(ui, t("Mở thư mục", "Open folder")).clicked() {
-                    open_folder_in_os(data_dir());
-                }
-            });
+            if show_st {
+                pref_row(ui, col_w, st_title, &st_desc, |ui| {
+                    if outline_button(ui, t("Mở thư mục", "Open folder")).clicked() {
+                        open_folder_in_os(data_dir());
+                    }
+                });
+            }
+            if show_db {
+                pref_row(ui, col_w, db_title, &db_desc, |ui| {
+                    if outline_button(ui, t("Sao lưu JSON", "Export backup")).clicked() {
+                        app.actions.push(Action::ExportDatabaseBackup);
+                    }
+                });
+            }
         }
     }
 
@@ -734,5 +986,129 @@ mod tests {
                 "col_w={col_w}: expected control right near {expected_right}, got {ctrl_right}"
             );
         }
+    }
+
+    #[test]
+    fn spotify_select_opens_popup_on_single_click_without_double_toggling() {
+        let ctx = egui::Context::default();
+        apply_style(&ctx);
+        let mut style = SurfaceStyle::Standard;
+        let mut btn_center = Pos2::ZERO;
+        let mut popup_id = Id::NULL;
+
+        // Frame 1: measure button center and popup id.
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    popup_id = ui.make_persistent_id("test-surface-select");
+                    let before = ui.cursor().min;
+                    let _ = spotify_select(
+                        ui,
+                        "test-surface-select",
+                        "Mặc định (Tối)",
+                        200.0,
+                        &[
+                            (SurfaceStyle::Standard, "Mặc định (Tối)"),
+                            (SurfaceStyle::Acrylic, "Windows Acrylic"),
+                        ],
+                        &mut style,
+                    );
+                    btn_center = before + Vec2::new(100.0, 16.0);
+                });
+            },
+        );
+        out.textures_delta.clear();
+        assert!(!egui::Popup::is_id_open(&ctx, popup_id));
+
+        // Frame 2 + 3: pointer down then up at button center -> popup MUST stay open!
+        for pressed in [true, false] {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(btn_center));
+            raw.events.push(egui::Event::PointerButton {
+                pos: btn_center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = spotify_select(
+                        ui,
+                        "test-surface-select",
+                        "Mặc định (Tối)",
+                        200.0,
+                        &[
+                            (SurfaceStyle::Standard, "Mặc định (Tối)"),
+                            (SurfaceStyle::Acrylic, "Windows Acrylic"),
+                        ],
+                        &mut style,
+                    );
+                });
+            });
+            out.textures_delta.clear();
+        }
+        assert!(
+            egui::Popup::is_id_open(&ctx, popup_id),
+            "clicking spotify_select must leave the popup open (not double-toggle shut)"
+        );
+        // Render one frame with the popup open and verify it stays compact (~200-240px, never stretching to 560px).
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = spotify_select(
+                        ui,
+                        "test-surface-select",
+                        "Mặc định (Tối)",
+                        200.0,
+                        &[
+                            (SurfaceStyle::Standard, "Mặc định (Tối)"),
+                            (SurfaceStyle::Acrylic, "Windows Acrylic (Kính mờ)"),
+                        ],
+                        &mut style,
+                    );
+                });
+            },
+        );
+        out.textures_delta.clear();
+        let popup_rect = ctx.memory(|m| m.area_rect(popup_id)).expect("open dropdown popup rect");
+        assert!(
+            popup_rect.width() <= 246.0,
+            "dropdown popup must stay compact near button width, got {}px",
+            popup_rect.width()
+        );
+    }
+
+    #[test]
+    fn surface_style_syncs_transparent_root_panel_fill_for_mica_and_acrylic() {
+        let ctx = egui::Context::default();
+        apply_style(&ctx);
+        assert_eq!(ctx.global_style().visuals.panel_fill, PANEL);
+
+        for style in [SurfaceStyle::Acrylic, SurfaceStyle::Mica, SurfaceStyle::MicaAlt] {
+            sync_surface_and_accent(&ctx, style, AccentTheme::OceanBlue);
+            assert_eq!(
+                ctx.global_style().visuals.panel_fill,
+                Color32::TRANSPARENT,
+                "{style:?} must set root panel_fill transparent so native DWM Mica/Acrylic shines through"
+            );
+            assert_eq!(
+                ctx.global_style().visuals.hyperlink_color,
+                accent_color(AccentTheme::OceanBlue)
+            );
+        }
+
+        sync_surface_and_accent(&ctx, SurfaceStyle::Standard, AccentTheme::SpotifyGreen);
+        assert_eq!(ctx.global_style().visuals.panel_fill, PANEL);
     }
 }

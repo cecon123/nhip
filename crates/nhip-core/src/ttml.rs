@@ -94,6 +94,9 @@ pub fn parse(xml: &str) -> io::Result<Lyrics> {
         synced,
         songwriter,
         provider,
+        source: Some(if apple { "apple_music" } else { "ttml" }.to_string()),
+        attribution: None,
+        track_ids: None,
     })
 }
 

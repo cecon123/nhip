@@ -137,30 +137,44 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
             let side = if w < 640.0 { 16.0 } else { 24.0 };
             let hero_h = pages::hero_height_for_width(w);
             let (hero, _) = ui.allocate_exact_size(Vec2::new(w, hero_h), Sense::hover());
+            let accent = accent_color(app.data.settings.accent_theme);
             let tint = if taste {
                 pages::adaptive_hero_color(app, "liked", true)
             } else {
-                ELEVATED.lerp_to_gamma(ACCENT, 0.18)
+                ELEVATED.lerp_to_gamma(accent, 0.22)
             };
             pages::draw_full_bleed_gradient(
                 ui.painter(),
                 Rect::from_min_size(hero.min, Vec2::new(w, hero_h + 100.0)),
                 tint,
-                PANEL,
+                if app.data.settings.surface_style == crate::library::SurfaceStyle::Standard {
+                    PANEL
+                } else {
+                    eframe::egui::Color32::TRANSPARENT
+                },
             );
             let avatar_side = hero_h - 56.0;
             let avatar = Rect::from_min_size(
                 Pos2::new(hero.left() + side, hero.bottom() - avatar_side - 24.0),
                 Vec2::splat(avatar_side),
             );
+            let display_name = {
+                let n = app.data.settings.profile_name.trim();
+                if n.is_empty() { "Nhịp" } else { n }.to_string()
+            };
+            let initial = display_name
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "N".to_string());
             cover_shadow(ui.painter(), avatar, avatar_side * 0.5);
             ui.painter()
-                .circle_filled(avatar.center(), avatar_side * 0.5, ELEVATED);
+                .circle_filled(avatar.center(), avatar_side * 0.5, ELEVATED.lerp_to_gamma(accent, 0.25));
             text(
                 ui.painter(),
                 avatar.center(),
-                "N",
-                bold(avatar_side * 0.5),
+                &initial,
+                bold((avatar_side * 0.48).round()),
                 TEXT,
                 avatar_side,
                 Align2::CENTER_CENTER,
@@ -179,11 +193,11 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
                 );
                 ui.label(
                     RichText::new(if taste {
-                        app.t("Gu âm nhạc", "Music taste")
+                        app.t("Gu âm nhạc", "Music taste").to_string()
                     } else {
-                        "Nhịp"
+                        display_name
                     })
-                    .font(bold(if taste { 32.0 } else { 64.0 }))
+                    .font(bold(if taste { 32.0 } else { 56.0 }))
                     .color(TEXT),
                 );
                 let liked = app
@@ -195,16 +209,24 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
                             && !app.data.hidden_tracks.contains(&entry.id)
                     })
                     .count();
-                ui.label(
-                    RichText::new(format!(
+                let plays = app.data.total_completed_plays();
+                let meta = if plays > 0 {
+                    format!(
+                        "{liked} {} • {} {} • {plays} {}",
+                        app.t("bài đã thích", "liked songs"),
+                        app.data.playlists.len() + app.data.followed_ytm.len(),
+                        app.t("danh sách phát", "playlists"),
+                        app.t("lượt nghe", "plays"),
+                    )
+                } else {
+                    format!(
                         "{liked} {} • {} {}",
                         app.t("bài đã thích", "liked songs"),
                         app.data.playlists.len() + app.data.followed_ytm.len(),
-                        app.t("danh sách phát", "playlists")
-                    ))
-                    .font(body_small())
-                    .color(SUBTLE),
-                );
+                        app.t("danh sách phát", "playlists"),
+                    )
+                };
+                ui.label(RichText::new(meta).font(body_small()).color(SUBTLE));
             }
 
             let (tabs, _) = ui.allocate_exact_size(Vec2::new(w, 56.0), Sense::hover());
@@ -220,6 +242,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
                     app.actions.push(Action::Navigate(route));
                 }
                 x += width + 8.0;
+            }
+            let edit_lbl = app.t("Cá nhân hóa", "Personalize");
+            let edit_w = pill_width(ui, edit_lbl);
+            let edit_rect = Rect::from_min_size(Pos2::new(x, tabs.top() + 12.0), Vec2::new(edit_w, 32.0));
+            if pill(ui, edit_rect, "profile-personalize-btn", edit_lbl, false).clicked() {
+                app.actions.push(Action::Navigate(Route::Settings));
             }
 
             if taste || artists.is_empty() {

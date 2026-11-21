@@ -799,10 +799,10 @@ fn show_sort_and_view_menu(
     current_sort: LibrarySortBy,
     current_view: LibraryViewMode,
 ) {
-    const MENU_W: f32 = 176.0;
+    const MENU_W: f32 = 160.0;
     let mut next_sort = None;
     let mut next_view = None;
-    let frame = popup_frame(ui.style());
+    let frame = menu_frame(ui.style());
     let t_sort_by = app.t("Sắp xếp theo", "Sort by");
     let t_view_as = app.t("Xem dưới dạng", "View as");
     let sort_options = [
@@ -822,13 +822,15 @@ fn show_sort_and_view_menu(
         .frame(frame)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             ui.set_min_width(MENU_W);
             ui.set_max_width(MENU_W);
-            ui.label(RichText::new(t_sort_by).font(semi(12.0)).color(SUBTLE));
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            ui.label(RichText::new(t_sort_by).font(semi(11.5)).color(SUBTLE));
+            ui.add_space(2.0);
             for (sort, label) in sort_options {
                 let active = sort == current_sort;
-                let (r, resp) = ui.allocate_exact_size(Vec2::new(MENU_W, 34.0), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(MENU_W, 27.0), Sense::click());
                 if resp.hovered() {
                     ui.painter().rect_filled(r, RADIUS_BASE, TINT_HOVER);
                 }
@@ -836,15 +838,15 @@ fn show_sort_and_view_menu(
                     ui.painter(),
                     Pos2::new(r.left() + 8.0, r.center().y),
                     label,
-                    body(13.5),
+                    body(13.0),
                     if active { ACCENT } else { TEXT },
-                    MENU_W - 36.0,
+                    MENU_W - 32.0,
                     Align2::LEFT_CENTER,
                 );
                 if active {
                     icons::paint(
                         ui.painter(),
-                        Rect::from_center_size(Pos2::new(r.right() - 14.0, r.center().y), Vec2::splat(14.0)),
+                        Rect::from_center_size(Pos2::new(r.right() - 12.0, r.center().y), Vec2::splat(13.0)),
                         Icon::Checkmark,
                         ACCENT,
                     );
@@ -854,20 +856,20 @@ fn show_sort_and_view_menu(
                 }
             }
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             let (div_r, _) = ui.allocate_exact_size(Vec2::new(MENU_W, 1.0), Sense::hover());
             ui.painter().rect_filled(div_r, 0.0, HAIRLINE);
-            ui.add_space(6.0);
+            ui.add_space(4.0);
 
-            ui.label(RichText::new(t_view_as).font(semi(12.0)).color(SUBTLE));
-            ui.add_space(6.0);
-            let (tray_rect, _) = ui.allocate_exact_size(Vec2::new(MENU_W, 38.0), Sense::hover());
+            ui.label(RichText::new(t_view_as).font(semi(11.5)).color(SUBTLE));
+            ui.add_space(4.0);
+            let (tray_rect, _) = ui.allocate_exact_size(Vec2::new(MENU_W, 32.0), Sense::hover());
             ui.painter().rect_filled(tray_rect, RADIUS_CARD, CARD);
-            let cell_w = (tray_rect.width() - 8.0) / 4.0;
+            let cell_w = (tray_rect.width() - 6.0) / 4.0;
             for (i, (mode, icon, tip)) in view_options.into_iter().enumerate() {
                 let cell = Rect::from_min_size(
-                    Pos2::new(tray_rect.left() + 4.0 + i as f32 * cell_w, tray_rect.top() + 4.0),
-                    Vec2::new(cell_w, 30.0),
+                    Pos2::new(tray_rect.left() + 3.0 + i as f32 * cell_w, tray_rect.top() + 3.0),
+                    Vec2::new(cell_w, 26.0),
                 );
                 let resp = ui
                     .interact(cell, ui.scope_id().with(("view-seg", i)), Sense::click())

@@ -408,6 +408,9 @@ pub fn parse_lyricsplus_json(v: &Value) -> Option<crate::lrc::Lyrics> {
         synced: true,
         songwriter,
         provider: Some(provider),
+        source: Some(provider.to_ascii_lowercase().replace(' ', "_")),
+        attribution: None,
+        track_ids: None,
     })
 }
 

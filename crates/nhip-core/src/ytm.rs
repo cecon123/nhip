@@ -160,6 +160,8 @@ impl Item {
             added: 0,
             mtime: 0,
             lyrics: None,
+            spotify_id: None,
+            isrc: None,
         })
     }
 }
@@ -798,6 +800,49 @@ pub fn related_songs(video_id: &str) -> Result<Vec<Item>, Error> {
 }
 
 pub fn online_lyrics(track: &crate::library::Track) -> Option<crate::lrc::Lyrics> {
+    let cfg = crate::spicy::SpicyApiConfig::from_settings(&crate::library::Settings::default());
+    online_lyrics_with_config(track, &cfg)
+}
+
+/// Lyrics Provider Manager:
+/// 1. Spicy Lyrics API first when enabled and authenticated/configured.
+/// 2. Existing fallback providers in their preserved order (LyricsPlus v2 -> YouTube Music / LRCLIB).
+pub fn online_lyrics_with_config(
+    track: &crate::library::Track,
+    spicy_config: &crate::spicy::SpicyApiConfig,
+) -> Option<crate::lrc::Lyrics> {
+    if spicy_config.is_eligible() {
+        if let Ok(lyrics) = crate::spicy::fetch_for_track(track, spicy_config) {
+            if !lyrics.lines.is_empty() {
+                return Some(lyrics);
+            }
+        }
+    }
+    online_lyrics_fallbacks(track)
+}
+
+/// Testable provider-order coordinator: tries Spicy Lyrics first when eligible, then invokes `fallback`.
+pub fn resolve_lyrics_provider_chain<F>(
+    track: &crate::library::Track,
+    spicy_config: &crate::spicy::SpicyApiConfig,
+    spicy_state: &crate::spicy::SpicyClientState,
+    fallback: F,
+) -> Option<crate::lrc::Lyrics>
+where
+    F: FnOnce(&crate::library::Track) -> Option<crate::lrc::Lyrics>,
+{
+    if spicy_config.is_eligible() {
+        if let Ok(lyrics) = crate::spicy::fetch_for_track_with_state(track, spicy_config, spicy_state)
+        {
+            if !lyrics.lines.is_empty() {
+                return Some(lyrics);
+            }
+        }
+    }
+    fallback(track)
+}
+
+fn online_lyrics_fallbacks(track: &crate::library::Track) -> Option<crate::lrc::Lyrics> {
     static CACHE: OnceLock<Mutex<HashMap<String, crate::lrc::Lyrics>>> = OnceLock::new();
     let key = format!("{}|{}|{}|{}|{}", track.youtube_id().unwrap_or_default(), track.title, track.artist, track.album, track.duration_ms);
     let cache = CACHE.get_or_init(Mutex::default);
@@ -825,6 +870,7 @@ pub fn online_lyrics(track: &crate::library::Track) -> Option<crate::lrc::Lyrics
             .map(|text| {
                 let mut l = crate::lrc::Lyrics::parse(&text);
                 l.provider = Some("LRCLIB");
+                l.source = Some("lrclib".to_string());
                 l
             })
             .filter(|l| !l.lines.is_empty());
@@ -840,7 +886,7 @@ pub fn online_lyrics(track: &crate::library::Track) -> Option<crate::lrc::Lyrics
             2 => {
                 word_synced = lyrics;
                 lp_done = true;
-                // Prioritize LyricsPlus v2 (just like Spicy Lyrics): return immediately whenever LyricsPlus succeeds!
+                // Prioritize LyricsPlus v2: return immediately whenever LyricsPlus succeeds!
                 if word_synced.as_ref().is_some_and(|l| l.synced) {
                     break;
                 }
@@ -2615,6 +2661,89 @@ mod tests {
         let cached = Instant::now();
         assert!(online_lyrics(&track).is_some());
         eprintln!("Cached lookup: {:?}", cached.elapsed());
+    }
+
+    #[test]
+    fn spicy_provider_runs_first_and_falls_back_cleanly_on_failure_or_unconfigured() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() {
+                    continue;
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let (status, body) = if path == "/v1/lyrics/4cOdK2wGLETKBW3PvgPWqT" {
+                    (
+                        200,
+                        r#"{"Status":200,"Type":"object","Body":{"id":"4cOdK2wGLETKBW3PvgPWqT","ids":{"spotify":"4cOdK2wGLETKBW3PvgPWqT"},"source":"spicy_lyrics","Type":"Line","Content":[{"Type":"Vocal","Text":"From Spicy First","StartTime":1.0,"EndTime":3.0}]}}"#,
+                    )
+                } else {
+                    (
+                        404,
+                        r#"{"Status":404,"Type":"error","Body":{"error":"lyrics_not_found","message":"missing"}}"#,
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let mut s = stream;
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let mut track = crate::library::demo_tracks().remove(0);
+        track.spotify_id = Some("4cOdK2wGLETKBW3PvgPWqT".into());
+        let cfg = crate::spicy::SpicyApiConfig {
+            enabled: true,
+            api_key: Some("sl_pk_demo".into()),
+            base_url,
+            timeout: Duration::from_secs(2),
+            cache_ttl_secs: 60,
+            cache_path: None,
+        };
+        let state = crate::spicy::SpicyClientState::new();
+
+        // 1. Spicy succeeds -> fallback is NEVER called.
+        let fallback_called = AtomicBool::new(false);
+        let winner = resolve_lyrics_provider_chain(&track, &cfg, &state, |_| {
+            fallback_called.store(true, Ordering::SeqCst);
+            Some(crate::lrc::Lyrics::parse("[00:01.00]Fallback"))
+        })
+        .expect("spicy lyrics");
+        assert_eq!(winner.lines[0].text, "From Spicy First");
+        assert!(!fallback_called.load(Ordering::SeqCst));
+
+        // 2. Spicy 404 -> fallback IS invoked and returned.
+        let mut missing = track.clone();
+        missing.spotify_id = Some("9999999999999999999999".into());
+        let fallback_res = resolve_lyrics_provider_chain(&missing, &cfg, &state, |_| {
+            Some(crate::lrc::Lyrics::parse("[00:01.00]From Fallback"))
+        })
+        .expect("fallback lyrics");
+        assert_eq!(fallback_res.lines[0].text, "From Fallback");
+
+        // 3. Spicy disabled -> skips Spicy and goes straight to fallback.
+        let disabled_cfg = crate::spicy::SpicyApiConfig { enabled: false, ..cfg };
+        let disabled_res = resolve_lyrics_provider_chain(&track, &disabled_cfg, &state, |_| {
+            Some(crate::lrc::Lyrics::parse("[00:01.00]Fallback When Disabled"))
+        })
+        .expect("disabled fallback");
+        assert_eq!(disabled_res.lines[0].text, "Fallback When Disabled");
     }
 
     #[test]

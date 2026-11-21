@@ -454,6 +454,9 @@ fn format_compact_count(lang: crate::library::Lang, count: f64) -> String {
 }
 
 fn home_recommendation_seed(app: &App) -> Option<String> {
+    if !app.data.settings.personalize_home {
+        return None;
+    }
     let mut best: Option<(i32, String)> = None;
     let mut seen = std::collections::HashSet::new();
     for (rank, id) in app
@@ -587,6 +590,32 @@ fn draw_ytm_home(
 
     let mut shelves = Vec::new();
     let filter = app.home_filter;
+    if app.data.settings.personalize_home && matches!(filter, HomeFilter::All | HomeFilter::Music) {
+        let heavy_cards: Vec<CardData> = app
+            .data
+            .top_played_tracks(&app.lib, 12)
+            .into_iter()
+            .filter_map(|id| app.track(id))
+            .filter_map(|track| Item::from_track(&track))
+            .map(|it| CardData::from_ytm(app, &it, page))
+            .collect();
+        if !heavy_cards.is_empty() {
+            let who = app.data.settings.profile_name.trim();
+            let title = if who.is_empty() || who == "Nhịp" {
+                app.t("Nghe nhiều nhất", "Heavy rotation").to_string()
+            } else {
+                match app.lang() {
+                    crate::library::Lang::Vi => format!("Dành riêng cho {who}"),
+                    crate::library::Lang::En => format!("Made for {who}"),
+                }
+            };
+            shelves.push(HomeShelf {
+                id: "ytm-heavy-rotation".into(),
+                title,
+                cards: heavy_cards,
+            });
+        }
+    }
     if matches!(filter, HomeFilter::All | HomeFilter::Music) && !history_cards.is_empty() {
         shelves.push(HomeShelf {
             id: "ytm-recent".into(),
@@ -958,7 +987,13 @@ fn draw_search_page(
 
         // Sticky Search Filter Chips Bar.
         let sticky_r = Rect::from_min_size(Pos2::new(origin.x, origin.y + scroll_y), Vec2::new(w, chips_h));
-        ui.painter().rect_filled(sticky_r, 0.0, PANEL);
+        let sticky_bg = if app.data.settings.surface_style == crate::library::SurfaceStyle::Standard {
+            PANEL
+        } else {
+            let a = (app.data.settings.surface_opacity.clamp(0.25, 0.95) * 0.78 * 255.0).round() as u8;
+            Color32::from_rgba_unmultiplied(16, 18, 22, a)
+        };
+        ui.painter().rect_filled(sticky_r, 0.0, sticky_bg);
         if scroll_y > 8.0 {
             ui.painter().hline(sticky_r.x_range(), sticky_r.bottom(), Stroke::new(1.0, HAIRLINE));
         }

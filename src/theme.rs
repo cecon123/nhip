@@ -50,6 +50,14 @@ pub const RADIUS_LARGER: f32 = 6.0;
 pub const RADIUS_CARD: f32 = 8.0;
 pub const RADIUS_MODAL: f32 = 16.0;
 pub const RADIUS_PILL: f32 = 9999.0;
+
+// Verified Spicy Lyrics GlassCard & Now Playing sidebar tokens (`tokens.css`, `NPVLyrics.css`, `default.css`)
+pub const GLASS_CARD_FILL: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18); // rgba(255,255,255,0.07)
+pub const GLASS_CARD_BORDER: Color32 = Color32::from_rgba_premultiplied(24, 24, 24, 24); // subtle glass hairline
+pub const GLASS_CARD_RADIUS_LG: u8 = 16; // --radius-lg (`NPVLyrics.css:12`)
+pub const GLASS_CARD_RADIUS_MD: u8 = 12; // --radius-md (`tokens.css:88`)
+pub const NPV_SIDE_INSET: f32 = 16.0;
+pub const NPV_SECTION_GAP: f32 = 12.0;
 pub const ROW_H: f32 = 56.0;
 pub const OPACITY_DISABLED: f32 = 0.3;
 pub const OPACITY_ACTIVE: f32 = 0.7;
@@ -133,12 +141,39 @@ pub fn hover_scale_rect(rect: egui::Rect, hovered: bool, pressed: bool) -> egui:
     }
 }
 
+pub fn accent_color(theme: crate::library::AccentTheme) -> Color32 {
+    let [r, g, b] = theme.rgb();
+    Color32::from_rgb(r, g, b)
+}
+
+/// Keeps `egui`'s root `CentralPanel` fill transparent whenever native Windows Mica / Acrylic is active
+/// (otherwise `eframe::App::ui` paints opaque `#121212` over the entire transparent GL framebuffer!),
+/// and updates interactive accent highlights to match the user's chosen `AccentTheme`.
+pub fn sync_surface_and_accent(
+    ctx: &egui::Context,
+    surface: crate::library::SurfaceStyle,
+    accent: crate::library::AccentTheme,
+) {
+    let ac = accent_color(accent);
+    let panel_fill = if surface == crate::library::SurfaceStyle::Standard {
+        PANEL
+    } else {
+        Color32::TRANSPARENT
+    };
+    ctx.global_style_mut(|style| {
+        style.visuals.panel_fill = panel_fill;
+        style.visuals.hyperlink_color = ac;
+        style.visuals.selection.bg_fill = ac.linear_multiply(0.35);
+        style.visuals.selection.stroke = Stroke::new(1.0, ac);
+    });
+}
+
 pub fn popup_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::new()
         .fill(POPUP)
         .stroke(Stroke::new(1.0, HAIRLINE))
         .corner_radius(card_radius(RADIUS_CARD as u8))
-        .inner_margin(egui::Margin::same(8))
+        .inner_margin(egui::Margin::same(5))
         .shadow(style.visuals.popup_shadow)
 }
 
@@ -147,7 +182,7 @@ pub fn menu_frame(style: &egui::Style) -> egui::Frame {
         .fill(POPUP)
         .stroke(Stroke::new(1.0, HAIRLINE))
         .corner_radius(card_radius(RADIUS_BASE as u8))
-        .inner_margin(egui::Margin::same(4))
+        .inner_margin(egui::Margin::same(3))
         .shadow(style.visuals.popup_shadow)
 }
 
@@ -205,13 +240,13 @@ pub fn apply_style(ctx: &egui::Context) {
         style.spacing.menu_margin = egui::Margin::same(4);
         style.spacing.scroll = egui::style::ScrollStyle {
             floating: true,
-            bar_width: 8.0,
-            floating_width: 6.0,
+            bar_width: 6.0,
+            floating_width: 5.0,
             handle_min_length: 30.0,
             foreground_color: false,
-            dormant_handle_opacity: 0.7,
-            active_handle_opacity: 1.0,
-            interact_handle_opacity: 1.0,
+            dormant_handle_opacity: 0.0,
+            active_handle_opacity: 0.55,
+            interact_handle_opacity: 0.85,
             dormant_background_opacity: 0.0,
             active_background_opacity: 0.0,
             interact_background_opacity: 0.0,

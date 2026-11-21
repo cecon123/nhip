@@ -494,7 +494,12 @@ pub(super) fn draw_home_page(
         // Paint 256px full-bleed adaptive wash at top of scroll content.
         let wash_rect = Rect::from_min_size(origin, Vec2::new(w, 256.0));
         // Spotify dwp-home-header.css overlays the ambient cover color with #0009.
-        draw_full_bleed_gradient(ui.painter(), wash_rect, current_color.lerp_to_gamma(Color32::BLACK, 0.6), PANEL);
+        let fade_bottom = if app.data.settings.surface_style == crate::library::SurfaceStyle::Standard {
+            PANEL
+        } else {
+            Color32::TRANSPARENT
+        };
+        draw_full_bleed_gradient(ui.painter(), wash_rect, current_color.lerp_to_gamma(Color32::BLACK, 0.6), fade_bottom);
 
         let chips_h = 64.0;
         let show_quick = matches!(app.home_filter, HomeFilter::All | HomeFilter::Music) && !quick.is_empty();
@@ -561,11 +566,16 @@ pub(super) fn draw_home_page(
 
         ui.ctx().data_mut(|d| d.insert_temp(hover_state_id, next_hover));
 
-        // Sticky 56px Home Filter Chips Bar (fades to opaque PANEL as content scrolls behind it).
+        // Sticky 56px Home Filter Chips Bar (respects translucent Mica/Acrylic when enabled).
         let sticky_rect = Rect::from_min_size(Pos2::new(origin.x, origin.y + scroll_y), Vec2::new(w, chips_h));
         let fade = (scroll_y / 36.0).clamp(0.0, 1.0);
         if fade > 0.01 {
-            let alpha = (fade * 245.0).round() as u8;
+            let max_a = if app.data.settings.surface_style == crate::library::SurfaceStyle::Standard {
+                245.0
+            } else {
+                (app.data.settings.panel_opacity.clamp(0.10, 0.95) * 215.0).clamp(48.0, 220.0)
+            };
+            let alpha = (fade * max_a).round() as u8;
             ui.painter().rect_filled(sticky_rect, 0.0, Color32::from_rgba_unmultiplied(PANEL.r(), PANEL.g(), PANEL.b(), alpha));
             if fade > 0.6 {
                 ui.painter().hline(sticky_rect.x_range(), sticky_rect.bottom(), Stroke::new(1.0, HAIRLINE));
@@ -579,24 +589,40 @@ pub(super) fn draw_home_page(
     load_more_clicked
 }
 
+fn step_ambient_rgb(cur: [f32; 3], target: [f32; 3], dt: f32) -> ([f32; 3], bool) {
+    let dt = dt.clamp(0.004, 0.08);
+    let k = 1.0 - (-dt * 5.0).exp();
+    let mut next = [0.0_f32; 3];
+    let mut max_diff = 0.0_f32;
+    for i in 0..3 {
+        next[i] = cur[i] + (target[i] - cur[i]) * k;
+        max_diff = max_diff.max((target[i] - next[i]).abs());
+    }
+    if max_diff < 0.5 {
+        (target, false)
+    } else {
+        (next, true)
+    }
+}
+
 fn animate_ambient_color(ctx_ui: &Ui, id: Id, target: Color32, animate: bool) -> Color32 {
-    let mut cur = ctx_ui.ctx().data(|d| d.get_temp::<Color32>(id)).unwrap_or(target);
+    let target_rgb = [target.r() as f32, target.g() as f32, target.b() as f32];
+    let cur = ctx_ui.ctx().data(|d| d.get_temp::<[f32; 3]>(id)).unwrap_or(target_rgb);
     if !animate {
-        ctx_ui.ctx().data_mut(|d| d.insert_temp(id, target));
+        ctx_ui.ctx().data_mut(|d| d.insert_temp(id, target_rgb));
         return target;
     }
-    let dt = ctx_ui.input(|i| i.unstable_dt).clamp(0.008, 0.08);
-    let t = (dt * 3.5).clamp(0.0, 1.0);
-    let next = cur.lerp_to_gamma(target, t);
-    let diff = (next.r() as i32 - target.r() as i32).abs()
-        + (next.g() as i32 - target.g() as i32).abs()
-        + (next.b() as i32 - target.b() as i32).abs();
-    cur = if diff <= 3 { target } else { next };
-    ctx_ui.ctx().data_mut(|d| d.insert_temp(id, cur));
-    if cur != target {
-        ctx_ui.ctx().request_repaint();
+    let dt = ctx_ui.input(|i| i.unstable_dt);
+    let (next, animating) = step_ambient_rgb(cur, target_rgb, dt);
+    ctx_ui.ctx().data_mut(|d| d.insert_temp(id, next));
+    if animating && !ctx_ui.input(|i| i.viewport().minimized.unwrap_or(false)) {
+        ctx_ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
-    cur
+    Color32::from_rgb(
+        next[0].round().clamp(0.0, 255.0) as u8,
+        next[1].round().clamp(0.0, 255.0) as u8,
+        next[2].round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 fn home_chips_bar(app: &mut App, ui: &mut Ui, row: Rect, side: f32) {
@@ -2435,37 +2461,58 @@ pub(super) fn draw_tracklist_controls(app: &mut App, ui: &mut Ui, right_x: f32, 
         s_col,
     );
 
-    egui::Popup::menu(&sort_resp).show(|ui| {
-        ui.set_min_width(196.0);
-        ui.label(egui::RichText::new(app.t("Sắp xếp theo", "Sort by")).font(semi(11.5)).color(SUBTLE));
-        for (col, label) in [
-            (TrackSortColumn::Default, app.t("Thứ tự tùy chỉnh", "Custom order")),
-            (TrackSortColumn::Title, app.t("Tiêu đề", "Title")),
-            (TrackSortColumn::Artist, app.t("Nghệ sĩ", "Artist")),
-            (TrackSortColumn::Album, "Album"),
-            (TrackSortColumn::DateAdded, app.t("Ngày thêm", "Date added")),
-            (TrackSortColumn::Duration, app.t("Thời lượng", "Duration")),
-        ] {
-            let active = app.table_sort.column == col;
-            let text_label = if active { format!("✓  {label}") } else { format!("    {label}") };
-            if ui.button(text_label).clicked() {
-                app.actions.push(Action::SetTableSort(TableSort { column: col, ascending: true }));
-                ui.close();
+    egui::Popup::menu(&sort_resp)
+        .frame(menu_frame(ui.style()))
+        .show(|ui| {
+            const W: f32 = 164.0;
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.set_min_width(W);
+            ui.set_max_width(W);
+            ui.label(egui::RichText::new(app.t("Sắp xếp theo", "Sort by")).font(semi(11.5)).color(SUBTLE));
+            for (col, label) in [
+                (TrackSortColumn::Default, app.t("Thứ tự tùy chỉnh", "Custom order")),
+                (TrackSortColumn::Title, app.t("Tiêu đề", "Title")),
+                (TrackSortColumn::Artist, app.t("Nghệ sĩ", "Artist")),
+                (TrackSortColumn::Album, "Album"),
+                (TrackSortColumn::DateAdded, app.t("Ngày thêm", "Date added")),
+                (TrackSortColumn::Duration, app.t("Thời lượng", "Duration")),
+            ] {
+                let active = app.table_sort.column == col;
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(W, 27.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, RADIUS_SMALLER, hover_white(24));
+                }
+                text(ui.painter(), Pos2::new(r.left() + 8.0, r.center().y), label, body(13.0), if active { ACCENT } else { TEXT }, W - 30.0, Align2::LEFT_CENTER);
+                if active {
+                    icons::paint(ui.painter(), Rect::from_center_size(Pos2::new(r.right() - 12.0, r.center().y), Vec2::splat(13.0)), Icon::Checkmark, ACCENT);
+                }
+                if resp.clicked() {
+                    app.actions.push(Action::SetTableSort(TableSort { column: col, ascending: true }));
+                    ui.close();
+                }
             }
-        }
-        ui.separator();
-        ui.label(egui::RichText::new(app.t("Xem dưới dạng", "View as")).font(semi(11.5)).color(SUBTLE));
-        let l_lbl = if !compact { format!("✓  {}", app.t("Danh sách", "List")) } else { format!("    {}", app.t("Danh sách", "List")) };
-        let c_lbl = if compact { format!("✓  {}", app.t("Thu gọn", "Compact")) } else { format!("    {}", app.t("Thu gọn", "Compact")) };
-        if ui.button(l_lbl).clicked() {
-            app.actions.push(Action::SetCompactTracklist(false));
-            ui.close();
-        }
-        if ui.button(c_lbl).clicked() {
-            app.actions.push(Action::SetCompactTracklist(true));
-            ui.close();
-        }
-    });
+            ui.add_space(3.0);
+            ui.separator();
+            ui.label(egui::RichText::new(app.t("Xem dưới dạng", "View as")).font(semi(11.5)).color(SUBTLE));
+            for (want_compact, label) in [
+                (false, app.t("Danh sách", "List")),
+                (true, app.t("Thu gọn", "Compact")),
+            ] {
+                let active = compact == want_compact;
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(W, 27.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, RADIUS_SMALLER, hover_white(24));
+                }
+                text(ui.painter(), Pos2::new(r.left() + 8.0, r.center().y), label, body(13.0), if active { ACCENT } else { TEXT }, W - 30.0, Align2::LEFT_CENTER);
+                if active {
+                    icons::paint(ui.painter(), Rect::from_center_size(Pos2::new(r.right() - 12.0, r.center().y), Vec2::splat(13.0)), Icon::Checkmark, ACCENT);
+                }
+                if resp.clicked() {
+                    app.actions.push(Action::SetCompactTracklist(want_compact));
+                    ui.close();
+                }
+            }
+        });
 
     let filter_right = sort_rect.left() - 12.0;
     let avail = filter_right - min_left;
@@ -2997,5 +3044,28 @@ mod tests {
         let card = CardData::from_ytm(&app, &song, None);
         activate_card(&mut app, &card);
         assert!(matches!(app.actions.last(), Some(Action::SelectYouTubeSong(it)) if it.id == song.id));
+    }
+
+    #[test]
+    fn ambient_color_transition_converges_without_u8_quantization_deadlock() {
+        // Previously Color32 u8 truncation stalled forever at small dt=0.008 whenever per-channel delta < 18,
+        // spinning ctx.request_repaint() at 100% CPU while idle on Home.
+        let mut rgb = [42.0_f32, 42.0, 42.0];
+        let target = [56.0_f32, 54.0, 58.0];
+        let mut settled_frame = None;
+        for frame in 1..=200 {
+            let (next, animating) = step_ambient_rgb(rgb, target, 0.008);
+            rgb = next;
+            if !animating {
+                settled_frame = Some(frame);
+                break;
+            }
+        }
+        assert!(settled_frame.is_some(), "ambient color failed to converge; stuck at {rgb:?}");
+        assert_eq!(rgb, target);
+        // Once settled, subsequent idle frames must report animating == false.
+        let (again, animating) = step_ambient_rgb(rgb, target, 0.008);
+        assert_eq!(again, target);
+        assert!(!animating);
     }
 }

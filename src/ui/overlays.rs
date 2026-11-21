@@ -72,7 +72,7 @@ fn paint_modal_card(ui: &mut Ui, panel: Rect, id: &str) {
     ui.painter().rect_stroke(panel, radius, Stroke::new(1.0, HAIRLINE), egui::StrokeKind::Inside);
 }
 
-/// Shared Spotify-styled context/popover menu row (`40px` tall, icon + label + optional right shortcut/check).
+/// Shared compact desktop context/popover menu row (`30px` tall, icon + label + optional right shortcut/check).
 pub fn menu_row(
     ui: &mut Ui,
     icon: Option<Icon>,
@@ -81,8 +81,9 @@ pub fn menu_row(
     checked: bool,
     enabled: bool,
 ) -> egui::Response {
-    let w = ui.available_width().max(160.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), if enabled { Sense::click() } else { Sense::hover() });
+    let target_w = ui.min_rect().width().max(210.0);
+    let w = ui.available_width().min(target_w).max(136.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), if enabled { Sense::click() } else { Sense::hover() });
     if enabled && resp.hovered() {
         ui.painter().rect_filled(rect, RADIUS_SMALLER, Color32::from_white_alpha(25));
     }
@@ -100,36 +101,36 @@ pub fn menu_row(
     } else {
         SUBTLE
     };
-    let mut text_x = rect.left() + 12.0;
+    let mut text_x = rect.left() + 10.0;
     if let Some(ic) = icon {
-        let ir = Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(16.0));
+        let ir = Rect::from_center_size(Pos2::new(rect.left() + 17.0, rect.center().y), Vec2::splat(14.0));
         icons::paint(ui.painter(), ir, ic, icon_color);
-        text_x = rect.left() + 38.0;
+        text_x = rect.left() + 32.0;
     }
-    let mut right_reserve = 12.0;
+    let mut right_reserve = 10.0;
     if checked {
-        let cr = Rect::from_center_size(Pos2::new(rect.right() - 18.0, rect.center().y), Vec2::splat(16.0));
+        let cr = Rect::from_center_size(Pos2::new(rect.right() - 15.0, rect.center().y), Vec2::splat(14.0));
         icons::paint(ui.painter(), cr, Icon::Checkmark, ACCENT);
-        right_reserve = 34.0;
+        right_reserve = 28.0;
     } else if let Some(hint) = shortcut {
-        let hw = text_width(ui, hint, marginal());
+        let hw = text_width(ui, hint, marginal_small());
         text(
             ui.painter(),
-            Pos2::new(rect.right() - 12.0, rect.center().y),
+            Pos2::new(rect.right() - 10.0, rect.center().y),
             hint,
-            marginal(),
+            marginal_small(),
             if enabled { SUBTLE } else { MUTED },
             hw + 4.0,
             Align2::RIGHT_CENTER,
         );
-        right_reserve = hw + 22.0;
+        right_reserve = hw + 18.0;
     }
     let max_label_w = (rect.right() - right_reserve - text_x).max(20.0);
     text(
         ui.painter(),
         Pos2::new(text_x, rect.center().y),
         label,
-        body_small(),
+        body(13.0),
         fg,
         max_label_w,
         Align2::LEFT_CENTER,
@@ -145,14 +146,14 @@ fn draw_top_popover(app: &mut App, ui: &mut Ui, full: Rect, popover: TopPopover)
 
     let anchor_rect = match popover {
         TopPopover::Notifications => {
-            let w = 340.0f32.min(full.width() - 32.0);
+            let w = 304.0f32.min(full.width() - 32.0);
             let right = (full.right() - 190.0).clamp(w + 16.0, full.right() - 16.0);
-            Rect::from_min_size(Pos2::new(right - w, full.top() + TOP_BAR + 4.0), Vec2::new(w, 300.0))
+            Rect::from_min_size(Pos2::new(right - w, full.top() + TOP_BAR + 4.0), Vec2::new(w, 260.0))
         }
         TopPopover::Account => {
-            let w = 240.0f32.min(full.width() - 32.0);
+            let w = 196.0f32.min(full.width() - 32.0);
             let right = (full.right() - 140.0).clamp(w + 16.0, full.right() - 16.0);
-            Rect::from_min_size(Pos2::new(right - w, full.top() + TOP_BAR + 4.0), Vec2::new(w, 250.0))
+            Rect::from_min_size(Pos2::new(right - w, full.top() + TOP_BAR + 4.0), Vec2::new(w, 200.0))
         }
     };
 
@@ -166,6 +167,7 @@ fn draw_top_popover(app: &mut App, ui: &mut Ui, full: Rect, popover: TopPopover)
                 TopPopover::Notifications => popup_frame(ui.style()),
             };
             frame.show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
                 ui.set_width(anchor_rect.width());
                 match popover {
                     TopPopover::Notifications => notifications_popover(app, ui),
@@ -841,17 +843,39 @@ fn about_modal(app: &mut App, ui: &mut Ui, full: Rect) {
         return;
     }
 
-    text(top.painter(), panel.min + Vec2::new(24.0, 24.0), "Nhịp", title_medium(), TEXT, w - 80.0, Align2::LEFT_TOP);
+    let icon_tex_id = Id::NULL.with("about-nhip-icon-tex");
+    let icon_tex = top
+        .ctx()
+        .data(|d| d.get_temp::<egui::TextureHandle>(icon_tex_id))
+        .unwrap_or_else(|| {
+            const SZ: usize = 128;
+            let rgba = crate::render_nhip_icon_rgba(SZ);
+            let img = egui::ColorImage::from_rgba_unmultiplied([SZ, SZ], &rgba);
+            let tex = top
+                .ctx()
+                .load_texture("nhip-app-icon-128", img, egui::TextureOptions::LINEAR);
+            top.ctx().data_mut(|d| d.insert_temp(icon_tex_id, tex.clone()));
+            tex
+        });
+    let icon_r = Rect::from_min_size(panel.min + Vec2::new(24.0, 22.0), Vec2::splat(52.0));
+    top.painter().image(
+        icon_tex.id(),
+        icon_r,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+
+    text(top.painter(), panel.min + Vec2::new(88.0, 24.0), "Nhịp", title_medium(), TEXT, w - 130.0, Align2::LEFT_TOP);
     text(
         top.painter(),
-        panel.min + Vec2::new(24.0, 58.0),
+        panel.min + Vec2::new(88.0, 56.0),
         &format!("{} {}", app.t("Phiên bản", "Version"), env!("CARGO_PKG_VERSION")),
         semi(14.0),
         ACCENT,
-        w - 48.0,
+        w - 130.0,
         Align2::LEFT_TOP,
     );
-    let desc_rect = Rect::from_min_max(panel.min + Vec2::new(24.0, 88.0), panel.max - Vec2::new(24.0, 64.0));
+    let desc_rect = Rect::from_min_max(panel.min + Vec2::new(24.0, 92.0), panel.max - Vec2::new(24.0, 64.0));
     let mut desc_ui = top.new_child(UiBuilder::new().id_salt("about-body").max_rect(desc_rect));
     desc_ui.add(
         egui::Label::new(
@@ -970,7 +994,7 @@ fn draw_preview_feed_modal(app: &mut App, ui: &mut Ui, full: Rect) {
         idx as f32
     };
     if playing && !reduced {
-        top.ctx().request_repaint();
+        top.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
 
     let w = (full.width() - 84.0).clamp(560.0, 968.0);

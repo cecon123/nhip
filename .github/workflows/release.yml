@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0). Leave empty to use v<Cargo.toml version>."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark this GitHub Release as a pre-release"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as a draft GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build & Publish Windows x64 Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Add bundled rust-lld to PATH
+        run: |
+          $sysroot = rustc --print sysroot
+          $lldDir = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-msvc\bin"
+          if (-not (Test-Path (Join-Path $lldDir "rust-lld.exe"))) {
+            throw "Expected rust-lld.exe in $lldDir (required by .cargo/config.toml)"
+          }
+          $lldDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Added $lldDir to PATH"
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-x64
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $meta = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $pkgVersion = ($meta.packages | Where-Object { $_.name -eq "nhip" } | Select-Object -First 1).version
+
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_TAG)) {
+            $tag = $env:INPUT_TAG.Trim()
+          } else {
+            $tag = "v$pkgVersion"
+          }
+
+          if ($tag -notmatch '^[a-zA-Z0-9._-]+$') {
+            throw "Invalid release tag: '$tag'"
+          }
+
+          $isPrerelease = ($env:INPUT_PRERELEASE -eq "true") -or ($tag -match '-')
+          $zipName = "Nhip-$tag-windows-x64.zip"
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$pkgVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "prerelease=$($isPrerelease.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Release tag=$tag version=$pkgVersion prerelease=$isPrerelease asset=$zipName"
+
+      - name: Run workspace test suite
+        run: cargo test --workspace --locked
+
+      - name: Package Windows x64 portable release
+        run: |
+          $outZip = "dist/${{ steps.meta.outputs.zip_name }}"
+          .\package-windows.ps1 -OutputPath $outZip
+
+          $hash = (Get-FileHash -LiteralPath $outZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ steps.meta.outputs.zip_name }}" | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding ascii
+          Get-Content -LiteralPath "dist/SHA256SUMS.txt"
+
+      - name: Upload build artifacts to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nhip-${{ steps.meta.outputs.tag }}-windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Nhịp ${{ steps.meta.outputs.tag }}
+          draft: ${{ inputs.draft == true }}
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body: |
+            ## Nhịp ${{ steps.meta.outputs.tag }} (Windows x64 Portable)
+
+            ### Cách sử dụng
+            1. Tải `${{ steps.meta.outputs.zip_name }}` bên dưới và giải nén.
+            2. Chạy `nhip.exe` (chế độ portable đã bật sẵn qua file `nhip.portable`, dữ liệu thư viện và cài đặt lưu ngay trong cùng thư mục).
+
+            ### Kiểm tra toàn vẹn (SHA-256)
+            Xem file `SHA256SUMS.txt` đính kèm.
+          files: |
+            dist/${{ steps.meta.outputs.zip_name }}
+            dist/SHA256SUMS.txt

@@ -37,17 +37,45 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
     let expanded_lyrics =
         app.right_tab == RightTab::NowPlaying && app.lyrics_card_expanded && app.route != Route::Lyrics;
 
+    let mut npv_backdrop_phase = 0.0_f32;
+    let mut npv_backdrop_tex: Option<egui::TextureHandle> = None;
     if app.right_tab == RightTab::NowPlaying {
         if let Some(t) = app.current_track() {
-            let texture = app.art.backdrop_texture(ui.ctx(), &t.cover_key(), t.art_source());
+            let key = t.cover_key();
+            let texture = app.art.backdrop_texture(ui.ctx(), &key, t.art_source());
+            let target_colors = app.art.lyric_colors(&key);
             let motion = app.data.settings.effective_lyrics_motion();
-            let speed = if app.is_playing() { 1.15 } else { 0.22 };
-            let phase = if motion { ui.input(|i| i.time) as f32 * speed } else { 0.0 };
-            super::backdrop::paint(ui, rect, &texture, phase, 1.0, true, None);
-            if motion && !ui.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            let playing = app.is_playing();
+            let (animating, phase) = super::lyrics::draw_animated_backdrop_sidebar(
+                ui,
+                rect,
+                Some(t.id),
+                target_colors,
+                Some(texture.clone()),
+                motion,
+                playing,
+            );
+            npv_backdrop_phase = phase;
+            npv_backdrop_tex = Some(texture.clone());
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    Id::NULL.with("npv-glass-backdrop"),
+                    super::backdrop::GlassBackdropContext {
+                        panel_rect: rect,
+                        texture,
+                        phase,
+                        sidebar: true,
+                    },
+                );
+            });
+            if animating && !ui.input(|i| i.viewport().minimized.unwrap_or(false)) {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(25));
             }
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<super::backdrop::GlassBackdropContext>(Id::NULL.with("npv-glass-backdrop")));
         }
+    } else {
+        ui.ctx().data_mut(|d| d.remove::<super::backdrop::GlassBackdropContext>(Id::NULL.with("npv-glass-backdrop")));
     }
 
     if expanded_lyrics && app.current_track().is_some() {
@@ -71,14 +99,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
         RightTab::History => history(app, &mut child),
     }
     if app.right_tab == RightTab::NowPlaying {
-        if let Some(track) = app.current_track().filter(|_| ui.ctx().data(|d| d.get_temp::<bool>(Id::NULL.with("npv-scrolled")).unwrap_or(false))) {
-            let texture = app.art.backdrop_texture(ui.ctx(), &track.cover_key(), track.art_source());
-            let motion = app.data.settings.effective_lyrics_motion();
-            let speed = if app.is_playing() { 1.15 } else { 0.22 };
-            let phase = if motion { ui.input(|i| i.time) as f32 * speed } else { 0.0 };
+        if let Some(texture) = npv_backdrop_tex
+            .filter(|_| ui.ctx().data(|d| d.get_temp::<bool>(Id::NULL.with("npv-scrolled")).unwrap_or(false)))
+        {
             let mut fade = ui.new_child(UiBuilder::new().id_salt("npv-header-fade").max_rect(rect));
             fade.set_clip_rect(Rect::from_min_max(rect.min, Pos2::new(rect.right(), header_rect.bottom() + 32.0)).intersect(ui.clip_rect()));
-            super::backdrop::paint(&fade, rect, &texture, phase, 1.0, true, Some(header_h));
+            super::backdrop::paint(&fade, rect, &texture, npv_backdrop_phase, 1.0, true, Some(header_h));
             vertical_gradient(
                 ui.painter(),
                 Rect::from_min_max(rect.min, Pos2::new(rect.right(), header_rect.bottom() + 20.0)),
@@ -338,11 +364,43 @@ fn now_playing(app: &mut App, ui: &mut Ui, panel_hovered: bool) {
         prev != Some(t.id)
     });
 
-    let mut scroll = ScrollArea::vertical().id_salt("np-scroll").auto_shrink([false,false]);
-    if let Some(offset) = ui.ctx().data(|d| d.get_temp::<f32>(Id::NULL.with("npv-screenshot-scroll"))) {
-        scroll = scroll.vertical_scroll_offset(offset);
-    }
-    let scroll = scroll.show(ui, |ui| {
+    // Independent SidebarScrollController: thin translucent scrollbar, decoupled from nested lyrics scroll.
+    let scroll = ui
+        .scope(|ui| {
+            let sc = &mut ui.spacing_mut().scroll;
+            sc.floating = true;
+            sc.bar_width = 5.0;
+            sc.floating_width = 5.0;
+            sc.bar_outer_margin = 4.0;
+            sc.bar_inner_margin = 2.0;
+            sc.foreground_color = false;
+            sc.dormant_handle_opacity = 0.0;
+            sc.active_handle_opacity = 0.52;
+            sc.interact_handle_opacity = 0.80;
+            let vis = ui.visuals_mut();
+            vis.widgets.inactive.bg_fill = Color32::from_white_alpha(150);
+            vis.widgets.hovered.bg_fill = Color32::from_white_alpha(200);
+            vis.widgets.active.bg_fill = Color32::from_white_alpha(230);
+
+            // Prevent outer sidebar ScrollArea from stealing mouse wheel while pointer is inside the nested lyrics viewport.
+            let nested_lyrics_hovered = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(Id::NULL.with("npv-nested-lyrics-hovered")))
+                .unwrap_or(false);
+            let scroll_source = if nested_lyrics_hovered {
+                egui::scroll_area::ScrollSource::SCROLL_BAR
+            } else {
+                egui::scroll_area::ScrollSource::ALL
+            };
+
+            let mut scroll = ScrollArea::vertical()
+                .id_salt("np-scroll")
+                .scroll_source(scroll_source)
+                .auto_shrink([false, false]);
+            if let Some(offset) = ui.ctx().data(|d| d.get_temp::<f32>(Id::NULL.with("npv-screenshot-scroll"))) {
+                scroll = scroll.vertical_scroll_offset(offset);
+            }
+            scroll.show(ui, |ui| {
             if track_changed {
                 ui.scroll_to_rect(Rect::from_min_size(ui.cursor().min, Vec2::ONE), Some(Align::TOP));
             }
@@ -361,8 +419,8 @@ fn now_playing(app: &mut App, ui: &mut Ui, panel_hovered: bool) {
                 0.12,
             );
             let right_reserve = if share_alpha > 0.05 { 96.0 } else { 64.0 };
-            let room = (w - right_reserve - 16.0).max(60.0);
-            let title_rect = Rect::from_min_size(row.min + Vec2::new(16.0, 4.0), Vec2::new(room, 28.0));
+            let room = (w - right_reserve - NPV_SIDE_INSET).max(60.0);
+            let title_rect = Rect::from_min_size(row.min + Vec2::new(NPV_SIDE_INSET, 4.0), Vec2::new(room, 28.0));
             marquee_text(ui, title_rect, ("npv-title", t.id), &t.title, bold(22.0), TEXT);
             let title_click = ui
                 .interact(title_rect, ui.scope_id().with("npv-title-link"), Sense::click())
@@ -371,7 +429,7 @@ fn now_playing(app: &mut App, ui: &mut Ui, panel_hovered: bool) {
                 app.actions.push(Action::Navigate(track_route(&t)));
             }
 
-            let artists_rect = Rect::from_min_size(row.min + Vec2::new(16.0, 35.0), Vec2::new(room, 20.0));
+            let artists_rect = Rect::from_min_size(row.min + Vec2::new(NPV_SIDE_INSET, 35.0), Vec2::new(room, 20.0));
             draw_artist_links(app, ui, artists_rect, &t.artist, 14.0, "npv-artist");
 
             if share_alpha > 0.01 {
@@ -408,22 +466,24 @@ fn now_playing(app: &mut App, ui: &mut Ui, panel_hovered: bool) {
 
             // Suppress duplicate Lyrics card when Route::Lyrics is already active in center.
             if app.route != Route::Lyrics {
-                ui.add_space(12.0);
+                ui.add_space(NPV_SECTION_GAP);
                 super::lyrics::card(app, ui);
             } else {
-                ui.add_space(12.0);
+                ui.add_space(NPV_SECTION_GAP);
             }
 
             about_artist_card(app, ui, &t, w);
-            ui.add_space(12.0);
+            ui.add_space(NPV_SECTION_GAP);
             credits_card(app, ui, &t, w);
 
             if let Some(next) = app.player.peek_next().and_then(|id| app.lib.track(id)) {
-                ui.add_space(12.0);
+                ui.add_space(NPV_SECTION_GAP);
                 next_in_queue_card(app, ui, &next, w);
             }
-            ui.add_space(16.0);
-        });
+            ui.add_space(NPV_SIDE_INSET);
+        })
+        })
+        .inner;
     ui.ctx().data_mut(|d| d.insert_temp(Id::NULL.with("npv-scrolled"), scroll.state.clamped_offset().y > 0.5));
 }
 
@@ -517,10 +577,9 @@ fn about_artist_card(app: &mut App, ui: &mut Ui, t: &Track, panel_w: f32) {
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_space(16.0);
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 18))
-            .corner_radius(card_radius(RADIUS_CARD as u8))
+        ui.add_space(NPV_SIDE_INSET);
+        GlassCard::section()
+            .with_margin(egui::Margin::ZERO)
             .show(ui, |ui| ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                 ui.set_width(card_w);
                 let (banner_rect, banner_resp) =
@@ -539,8 +598,8 @@ fn about_artist_card(app: &mut App, ui: &mut Ui, t: &Track, panel_w: f32) {
 
                 // Draw aspect-fill top artist image + rounded top-corner dark readability scrim.
                 let top_radius = egui::CornerRadius {
-                    nw: RADIUS_CARD as u8,
-                    ne: RADIUS_CARD as u8,
+                    nw: GLASS_CARD_RADIUS_MD,
+                    ne: GLASS_CARD_RADIUS_MD,
                     sw: 0,
                     se: 0,
                 };
@@ -734,11 +793,8 @@ fn credits_card(app: &mut App, ui: &mut Ui, t: &Track, panel_w: f32) {
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_space(16.0);
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 18))
-            .corner_radius(card_radius(RADIUS_CARD as u8))
-            .inner_margin(16.0)
+        ui.add_space(NPV_SIDE_INSET);
+        GlassCard::section()
             .show(ui, |ui| ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                 let inner_w = (card_w - 32.0).max(100.0);
                 ui.set_width(inner_w);
@@ -820,11 +876,9 @@ fn next_in_queue_card(app: &mut App, ui: &mut Ui, next: &Arc<Track>, panel_w: f3
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_space(16.0);
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 18))
-            .corner_radius(card_radius(RADIUS_CARD as u8))
-            .inner_margin(12.0)
+        ui.add_space(NPV_SIDE_INSET);
+        GlassCard::section()
+            .with_margin(egui::Margin::same(12))
             .show(ui, |ui| ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                 let inner_w = (card_w - 24.0).max(100.0);
                 ui.set_width(inner_w);

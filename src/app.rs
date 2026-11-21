@@ -217,6 +217,8 @@ pub enum Action {
     PreviewFeedStep(isize),
     ClosePreviewFeed,
     ClosePopovers,
+    ExportDatabaseBackup,
+    ClearTasteHistory,
     SettingsChanged,
 }
 
@@ -305,7 +307,7 @@ pub struct App {
     session_lyrics_overrides: HashMap<TrackId, String>,
     pub ytm: crate::ui::ytm::Browser,
     lyrics_imported: bool,
-    lyrics_response: Option<Receiver<Option<Lyrics>>>,
+    lyrics_response: Option<(TrackId, Receiver<Option<Lyrics>>)>,
     session_played_yt: HashSet<String>,
     last_yt_seed: Option<String>,
     last_prefetched_next: Option<TrackId>,
@@ -326,6 +328,8 @@ pub struct App {
     last_save: Instant,
     library_dirty: bool,
     context: egui::Context,
+    #[cfg(windows)]
+    hwnd: Option<isize>,
     #[cfg(windows)]
     media: Option<crate::media::Media>,
     media_track: Option<TrackId>,
@@ -433,6 +437,8 @@ impl App {
             library_dirty: false,
             context: ctx.clone(),
             #[cfg(windows)]
+            hwnd: None,
+            #[cfg(windows)]
             media: None,
             media_track: None,
             media_playing: false,
@@ -446,6 +452,15 @@ impl App {
         app.player.shuffle = app.data.settings.shuffle;
         app.player.repeat = app.data.settings.repeat;
         app.apply_volume();
+        theme::sync_surface_and_accent(
+            &app.context,
+            if app.screenshot.is_some() {
+                crate::library::SurfaceStyle::Standard
+            } else {
+                app.data.settings.surface_style
+            },
+            app.data.settings.accent_theme,
+        );
         if !can_save_user {
             app.toast(app.t("Không thể đọc dữ liệu đã lưu. Tệp hiện có được bảo toàn.", "Could not read saved data. The existing file was preserved.").into());
         }
@@ -476,6 +491,52 @@ impl App {
     #[cfg(windows)]
     fn setup_media(&mut self, cc: &eframe::CreationContext<'_>) {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = cc.window_handle() else { return };
+        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+            let hwnd = h.hwnd.get();
+            self.hwnd = Some(hwnd);
+            self.apply_window_surface();
+            let wake = self.context.clone();
+            self.media = crate::media::Media::new(hwnd as *mut std::ffi::c_void, move || wake.request_repaint());
+        }
+    }
+
+    #[cfg(windows)]
+    fn apply_window_surface(&self) {
+        let style = self.data.settings.surface_style;
+        theme::sync_surface_and_accent(
+            &self.context,
+            if self.screenshot.is_some() {
+                crate::library::SurfaceStyle::Standard
+            } else {
+                style
+            },
+            self.data.settings.accent_theme,
+        );
+        let Some(hwnd) = self.hwnd else { return };
+        if self.screenshot.is_some() {
+            return;
+        }
+        #[repr(C)]
+        struct Margins {
+            left: i32,
+            right: i32,
+            top: i32,
+            bottom: i32,
+        }
+        #[repr(C)]
+        struct AccentPolicy {
+            accent_state: u32,
+            accent_flags: u32,
+            gradient_color: u32,
+            animation_id: u32,
+        }
+        #[repr(C)]
+        struct WindowCompositionAttribData {
+            attrib: u32,
+            data: *mut AccentPolicy,
+            size: usize,
+        }
         #[link(name = "dwmapi")]
         extern "system" {
             fn DwmSetWindowAttribute(
@@ -484,22 +545,149 @@ impl App {
                 pvAttribute: *const i32,
                 cbAttribute: u32,
             ) -> i32;
+            fn DwmExtendFrameIntoClientArea(hwnd: isize, pMarInset: *const Margins) -> i32;
         }
-        let Ok(handle) = cc.window_handle() else { return };
-        if let RawWindowHandle::Win32(h) = handle.as_raw() {
-            let hwnd = h.hwnd.get();
-            // SAFETY: Enables native Windows 11 DWM rounded corners + OS drop shadow on our main frameless window.
-            unsafe {
-                let round: i32 = 2; // DWMWCP_ROUND
-                let _ = DwmSetWindowAttribute(hwnd, 33, &round, 4);
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetWindowPos(
+                hwnd: isize,
+                hwnd_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                flags: u32,
+            ) -> i32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleA(lpModuleName: *const u8) -> isize;
+            fn GetProcAddress(hModule: isize, lpProcName: *const u8) -> *const std::ffi::c_void;
+        }
+
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_FRAMECHANGED: u32 = 0x0020;
+
+        let op = self.data.settings.surface_opacity.clamp(0.0, 0.95);
+        // SAFETY: Valid Win32 HWND obtained from `raw_window_handle`; all structs match Win32 ABI.
+        unsafe {
+            let dark: i32 = 1; // DWMWA_USE_IMMERSIVE_DARK_MODE
+            let _ = DwmSetWindowAttribute(hwnd, 20, &dark, 4);
+            let round: i32 = 2; // DWMWCP_ROUND
+            let _ = DwmSetWindowAttribute(hwnd, 33, &round, 4);
+
+            // Resolve SetWindowCompositionAttribute once so we can always clear stale WCA accent
+            // before setting Windows 11 DWMWA_SYSTEMBACKDROP_TYPE (prevents broken transitions
+            // between Acrylic, Mica, Mica Alt, and Standard).
+            let set_comp: Option<unsafe extern "system" fn(isize, *mut WindowCompositionAttribData) -> i32> = {
+                let user32 = GetModuleHandleA(b"user32.dll\0".as_ptr());
+                if user32 != 0 {
+                    let proc = GetProcAddress(user32, b"SetWindowCompositionAttribute\0".as_ptr());
+                    (!proc.is_null()).then(|| std::mem::transmute(proc))
+                } else {
+                    None
+                }
+            };
+
+            if let Some(f) = set_comp {
+                let mut reset = AccentPolicy {
+                    accent_state: 0, // ACCENT_DISABLED
+                    accent_flags: 0,
+                    gradient_color: 0,
+                    animation_id: 0,
+                };
+                let mut data = WindowCompositionAttribData {
+                    attrib: 19, // WCA_ACCENT_POLICY
+                    data: &mut reset,
+                    size: std::mem::size_of::<AccentPolicy>(),
+                };
+                let _ = f(hwnd, &mut data);
             }
-            let wake = self.context.clone();
-            self.media = crate::media::Media::new(hwnd as *mut std::ffi::c_void, move || wake.request_repaint());
+
+            let margins = if style == crate::library::SurfaceStyle::Standard {
+                Margins { left: 0, right: 0, top: 0, bottom: 0 }
+            } else {
+                Margins { left: -1, right: -1, top: -1, bottom: -1 }
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+            // Windows 11 22H2+ DWMWA_SYSTEMBACKDROP_TYPE (38):
+            // 1 = DWMSBT_NONE, 2 = DWMSBT_MAINWINDOW (Mica),
+            // 3 = DWMSBT_TRANSIENTWINDOW (Acrylic), 4 = DWMSBT_TABBEDWINDOW (Mica Alt).
+            let backdrop: i32 = match style {
+                crate::library::SurfaceStyle::Standard => 1,
+                crate::library::SurfaceStyle::Mica => 2,
+                crate::library::SurfaceStyle::Acrylic => 3,
+                crate::library::SurfaceStyle::MicaAlt => 4,
+            };
+            let hr = DwmSetWindowAttribute(hwnd, 38, &backdrop, 4);
+
+            // Fallback for Windows 10 / pre-22H2 builds where attribute 38 is unsupported.
+            if hr != 0 && style != crate::library::SurfaceStyle::Standard {
+                if let Some(f) = set_comp {
+                    // ABGR tint alpha dynamically driven by `surface_opacity` (0..220).
+                    let abgr_a = ((op * 0.72 * 255.0).round().clamp(12.0, 220.0) as u32) << 24;
+                    let mut policy = match style {
+                        crate::library::SurfaceStyle::Standard => AccentPolicy {
+                            accent_state: 0,
+                            accent_flags: 0,
+                            gradient_color: 0,
+                            animation_id: 0,
+                        },
+                        crate::library::SurfaceStyle::Mica | crate::library::SurfaceStyle::MicaAlt => AccentPolicy {
+                            accent_state: 3, // ACCENT_ENABLE_BLURBEHIND
+                            accent_flags: 2,
+                            gradient_color: abgr_a | 0x00141210,
+                            animation_id: 0,
+                        },
+                        crate::library::SurfaceStyle::Acrylic => AccentPolicy {
+                            accent_state: 4, // ACCENT_ENABLE_ACRYLICBLURBEHIND
+                            accent_flags: 2,
+                            gradient_color: abgr_a | 0x00161210,
+                            animation_id: 0,
+                        },
+                    };
+                    let mut data = WindowCompositionAttribData {
+                        attrib: 19,
+                        data: &mut policy,
+                        size: std::mem::size_of::<AccentPolicy>(),
+                    };
+                    let _ = f(hwnd, &mut data);
+                }
+            }
+
+            // Force DWM to immediately recomposite the new backdrop without waiting for a window resize.
+            let _ = SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
         }
+        self.context.request_repaint();
     }
 
     #[cfg(not(windows))]
     fn setup_media(&mut self, _cc: &eframe::CreationContext<'_>) {}
+
+    #[cfg(not(windows))]
+    fn apply_window_surface(&self) {
+        theme::sync_surface_and_accent(
+            &self.context,
+            if self.screenshot.is_some() {
+                crate::library::SurfaceStyle::Standard
+            } else {
+                self.data.settings.surface_style
+            },
+            self.data.settings.accent_theme,
+        );
+    }
 
     pub fn lang(&self) -> Lang {
         self.data.settings.lang
@@ -660,10 +848,13 @@ impl App {
             Some(
                 "lyrics"
                 | "lyrics-hover"
+                | "lyrics-line-hover"
+                | "lyrics-interlude"
                 | "lyrics-scroll"
                 | "lyrics-scroll-hover"
                 | "lyrics-scroll-below"
                 | "lyrics-card"
+                | "lyrics-card-scroll"
                 | "lyrics-fullscreen"
                 | "lyrics-cinema"
                 | "lyrics-cinema-hover"
@@ -681,8 +872,15 @@ impl App {
                 | "spicy-popup-bar",
             ) => {
                 let is_popup_mode = page.is_some_and(|p| p.starts_with("spicy-popup"));
-                if !matches!(page, Some("lyrics-card" | "cinema-slide-mid")) && !is_popup_mode {
+                if !matches!(page, Some("lyrics-card" | "lyrics-card-scroll" | "cinema-slide-mid"))
+                    && !is_popup_mode
+                {
                     self.route = Route::Lyrics;
+                }
+                if page == Some("lyrics-card-scroll") {
+                    self.context.data_mut(|d| {
+                        d.insert_temp(egui::Id::NULL.with("npv-screenshot-scroll"), 240.0_f32);
+                    });
                 }
                 if page == Some("cinema-slide-mid") {
                     self.context.data_mut(|d| {
@@ -728,6 +926,17 @@ impl App {
                         d.insert_temp(egui::Id::NULL.with("lyrics-force-top-hover"), true);
                     });
                 }
+                if page == Some("lyrics-line-hover") {
+                    self.context.data_mut(|d| {
+                        d.insert_temp(egui::Id::NULL.with("lyrics-force-hover-line"), Some(5usize));
+                    });
+                }
+                if page == Some("lyrics-interlude") {
+                    if let Some(id) = self.player.current {
+                        // Position inside a 10s interlude gap (61s..71s) to inspect RefreshedDots.
+                        self.start_track(id, 64_800, false);
+                    }
+                }
                 if matches!(page, Some("lyrics-scroll" | "lyrics-scroll-hover" | "lyrics-scroll-below")) {
                     self.context.data_mut(|d| {
                         d.insert_temp(egui::Id::NULL.with("lyrics-force-manual-scroll"), true);
@@ -769,18 +978,30 @@ impl App {
                     }
                 }
                 self.lyrics_for = self.player.current;
-                let mut parsed = crate::ttml::parse(r#"<tt xmlns="http://www.w3.org/ns/ttml"><head><metadata><songwriters><songwriter>Vũ Đinh Trọng Thắng</songwriter></songwriters></metadata></head><body><div>
-                    <p begin="56s" end="61s">Nắng rơi trên mái nhà</p>
-                    <p begin="61s" end="66s">Gió đùa qua tán lá</p>
-                    <p begin="66s" end="71s">Ta qua con đường nhỏ</p>
-                    <p begin="71s" end="78s"><span begin="0s" end="1s">Nghe</span>
-                        <span begin="1s" end="1.8s">thành</span> <span begin="1.8s" end="2.5s">phố</span>
-                        <span begin="2.5s" end="4.1s">thở</span> <span begin="4.1s" end="6s">chậm</span></p>
-                    <p begin="78s" end="83s">Một ngày dài vừa khép</p>
-                    <p begin="83s" end="89s">Còn ánh đèn bên sông</p>
-                    <p begin="89s" end="96s">Ta đi qua mùa nước</p>
-                    <p begin="96s" end="102s">Mang bình yên về nhà</p>
-                </div></body></tt>"#).ok();
+                let mut parsed = if page == Some("lyrics-interlude") {
+                    crate::ttml::parse(r#"<tt xmlns="http://www.w3.org/ns/ttml"><head><metadata><songwriters><songwriter>Vũ Đinh Trọng Thắng</songwriter></songwriters></metadata></head><body><div>
+                        <p begin="50s" end="55s">Nắng rơi trên mái nhà</p>
+                        <p begin="55s" end="60s">Gió đùa qua tán lá</p>
+                        <p begin="71s" end="78s"><span begin="0s" end="1s">Nghe</span>
+                            <span begin="1s" end="1.8s">thành</span> <span begin="1.8s" end="2.5s">phố</span>
+                            <span begin="2.5s" end="4.1s">thở</span> <span begin="4.1s" end="6s">chậm</span></p>
+                        <p begin="78s" end="83s">Một ngày dài vừa khép</p>
+                        <p begin="83s" end="89s">Còn ánh đèn bên sông</p>
+                    </div></body></tt>"#).ok()
+                } else {
+                    crate::ttml::parse(r#"<tt xmlns="http://www.w3.org/ns/ttml"><head><metadata><songwriters><songwriter>Vũ Đinh Trọng Thắng</songwriter></songwriters></metadata></head><body><div>
+                        <p begin="56s" end="61s">Nắng rơi trên mái nhà</p>
+                        <p begin="61s" end="66s">Gió đùa qua tán lá</p>
+                        <p begin="66s" end="71s">Ta qua con đường nhỏ</p>
+                        <p begin="71s" end="78s"><span begin="0s" end="1s">Nghe</span>
+                            <span begin="1s" end="1.8s">thành</span> <span begin="1.8s" end="2.5s">phố</span>
+                            <span begin="2.5s" end="4.1s">thở</span> <span begin="4.1s" end="6s">chậm</span></p>
+                        <p begin="78s" end="83s">Một ngày dài vừa khép</p>
+                        <p begin="83s" end="89s">Còn ánh đèn bên sông</p>
+                        <p begin="89s" end="96s">Ta đi qua mùa nước</p>
+                        <p begin="96s" end="102s">Mang bình yên về nhà</p>
+                    </div></body></tt>"#).ok()
+                };
                 if let Some(ref mut l) = parsed {
                     l.provider = Some("Apple Music");
                 }
@@ -971,8 +1192,9 @@ impl App {
                 }
                 let track_clone = (*next_track).clone();
                 if track_clone.youtube_id().is_some() {
+                    let spicy_cfg = crate::spicy::SpicyApiConfig::from_settings(&self.data.settings);
                     let _ = std::thread::Builder::new().name("lyrics-prefetch".into()).spawn(move || {
-                        let _ = crate::ytm::online_lyrics(&track_clone);
+                        let _ = crate::ytm::online_lyrics_with_config(&track_clone, &spicy_cfg);
                     });
                 }
             }
@@ -1290,15 +1512,17 @@ impl App {
                 }
             }
             Action::Next => {
-                if let Some(cur) = self.player.current {
-                    let pos = self.position_ms();
-                    let dur = self.duration_ms();
-                    if dur >= 30_000 && pos < 10_000 {
-                        self.data.record_fast_skip(cur);
-                        self.dirty = true;
-                    } else if pos >= 30_000 {
-                        self.data.record_play_complete(cur);
-                        self.dirty = true;
+                if !self.data.settings.private_session {
+                    if let Some(cur) = self.player.current {
+                        let pos = self.position_ms();
+                        let dur = self.duration_ms();
+                        if dur >= 30_000 && pos < 10_000 {
+                            self.data.record_fast_skip(cur);
+                            self.dirty = true;
+                        } else if pos >= 30_000 {
+                            self.data.record_play_complete(cur);
+                            self.dirty = true;
+                        }
                     }
                 }
                 self.error_streak = 0;
@@ -1914,10 +2138,28 @@ impl App {
                 self.top_popover = None;
                 self.search_dropdown_open = false;
             }
+            Action::ExportDatabaseBackup => {
+                if let Some(dest) = rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .set_file_name("nhip-backup.json")
+                    .save_file()
+                {
+                    match library::export_user_backup(&dest, &self.data) {
+                        Ok(()) => self.toast(self.t("Đã xuất bản sao lưu dữ liệu cục bộ", "Exported local database backup").into()),
+                        Err(_) => self.toast(self.t("Không thể xuất bản sao lưu", "Could not export backup").into()),
+                    }
+                }
+            }
+            Action::ClearTasteHistory => {
+                self.data.clear_taste_history();
+                self.dirty = true;
+                self.toast(self.t("Đã xóa lịch sử nghe và dữ liệu gu âm nhạc", "Cleared listening history and taste data").into());
+            }
             Action::SettingsChanged => {
                 self.engine.apply_settings(audio_settings(&self.data));
                 self.refresh_gains();
                 self.sync_next();
+                self.apply_window_surface();
                 self.dirty = true;
             }
         }
@@ -2091,8 +2333,10 @@ impl App {
     fn handle_engine_event(&mut self, event: Event) {
         match event {
             Event::Advanced(id) => {
-                if let Some(prev) = self.player.current {
-                    self.data.record_play_complete(prev);
+                if !self.data.settings.private_session {
+                    if let Some(prev) = self.player.current {
+                        self.data.record_play_complete(prev);
+                    }
                 }
                 self.error_streak = 0;
                 // The song the engine already started is the one the player expected.
@@ -2103,8 +2347,10 @@ impl App {
                 self.after_track_change();
             }
             Event::Finished => {
-                if let Some(prev) = self.player.current {
-                    self.data.record_play_complete(prev);
+                if !self.data.settings.private_session {
+                    if let Some(prev) = self.player.current {
+                        self.data.record_play_complete(prev);
+                    }
                 }
                 if self.halt_after_errors {
                     self.halt_after_errors = false;
@@ -2194,7 +2440,7 @@ impl App {
         }
         self.last_save = Instant::now();
         if self.library_dirty {
-            self.library_dirty = library::save_library_cache(&self.lib).is_err();
+            self.library_dirty = library::save_library_cache_pruned(&self.lib, &self.data).is_err();
             if self.library_dirty {
                 self.toast(self.t("Không thể lưu thư viện", "Could not save library").into());
                 return;
@@ -2364,19 +2610,24 @@ impl App {
                 if self.lyrics.is_none() && track.demo_seed().is_none() && self.screenshot.is_none() {
                     let (tx, rx) = mpsc::channel();
                     let wake = self.context.clone();
+                    let spicy_cfg = crate::spicy::SpicyApiConfig::from_settings(&self.data.settings);
                     let _ = std::thread::Builder::new().name("lyrics".into()).spawn(move || {
-                        let lyrics = crate::ytm::online_lyrics(&track);
+                        let lyrics = crate::ytm::online_lyrics_with_config(&track, &spicy_cfg);
                         let _ = tx.send(lyrics);
                         wake.request_repaint();
                     });
-                    self.lyrics_response = Some(rx);
+                    self.lyrics_response = Some((id, rx));
                 }
             }
         }
-        if let Some(rx) = &self.lyrics_response {
+        if let Some((req_id, rx)) = &self.lyrics_response {
+            let req_id = *req_id;
             match rx.try_recv() {
                 Ok(lyrics) => {
-                    self.lyrics = lyrics;
+                    // Guard against stale track responses overwriting the currently playing track's lyrics.
+                    if self.lyrics_for == Some(req_id) && self.player.current == Some(req_id) {
+                        self.lyrics = lyrics;
+                    }
                     self.lyrics_response = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.lyrics_response = None,
@@ -2634,7 +2885,7 @@ impl App {
         if !matches!(self.route, Route::Home | Route::Search | Route::YouTubeMusicItem(_)) {
             self.ytm.hide();
         }
-        if self.is_playing() && self.position_ms() > 0 {
+        if !self.data.settings.private_session && self.is_playing() && self.position_ms() > 0 {
             self.error_streak = 0;
             if let Some(id) = self.player.current {
                 if self.data.listening_history.first() != Some(&id) {
@@ -2649,15 +2900,27 @@ impl App {
                 self.toast = None;
             }
         }
+        if let Some(wait) = self.next_frame_repaint_wait() {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    fn next_frame_repaint_wait(&self) -> Option<Duration> {
         let busy = self.is_playing() || self.toast.is_some() || self.seek_drag.is_some();
-        let wait = if self.search_debounce_pending() {
-            Duration::from_millis(50)
+        let pending_save = (self.dirty && self.can_save_user) || self.library_dirty;
+        if self.search_debounce_pending() {
+            Some(Duration::from_millis(50))
         } else if busy {
-            Duration::from_millis(250)
+            Some(Duration::from_millis(250))
+        } else if pending_save {
+            Some(
+                Duration::from_secs(5)
+                    .saturating_sub(self.last_save.elapsed())
+                    .max(Duration::from_millis(250)),
+            )
         } else {
-            Duration::from_secs(1)
-        };
-        ctx.request_repaint_after(wait);
+            None
+        }
     }
 
     fn drive_screenshot(&mut self, ctx: &egui::Context) {
@@ -2697,6 +2960,14 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.screenshot.is_none() && self.data.settings.surface_style != crate::library::SurfaceStyle::Standard {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        }
+    }
+
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
         if self.screenshot.is_some() {
             input.events.retain(|event| !matches!(event, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. }));
@@ -2718,7 +2989,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.screenshot.is_none() {
-            let cached = !self.library_dirty || library::save_library_cache(&self.lib).is_ok();
+            let cached = !self.library_dirty || library::save_library_cache_pruned(&self.lib, &self.data).is_ok();
             if self.can_save_user && cached {
                 let _ = self.store_user();
             }
@@ -2808,6 +3079,8 @@ pub(crate) mod tests {
             last_save: Instant::now(),
             library_dirty: false,
             context: ctx,
+            #[cfg(windows)]
+            hwnd: None,
             #[cfg(windows)]
             media: None,
             media_track: None,
@@ -3501,6 +3774,69 @@ pub(crate) mod tests {
         assert_eq!(app.preview_feed.as_ref().map(|f| f.index), Some(1));
         app.run_action(Action::ClosePreviewFeed);
         assert!(app.preview_feed.is_none());
+        app.engine.stop();
+    }
+
+    #[test]
+    fn stale_track_lyrics_response_never_overwrites_current_track_lyrics() {
+        let mut app = test_app();
+        app.lib = crate::library::Library::new(crate::library::demo_tracks());
+        app.lib.demo = true;
+        let track_a = app.lib.order[0];
+        let track_b = app.lib.order[1];
+
+        // Track B is currently playing with its own valid lyrics.
+        app.player.current = Some(track_b);
+        app.lyrics_for = Some(track_b);
+        app.lyrics = Some(Lyrics::parse("[00:05.00] Current track B lyrics"));
+
+        // A delayed background fetch for Track A completes now.
+        let (tx, rx) = mpsc::channel();
+        tx.send(Some(Lyrics::parse("[00:01.00] Stale track A lyrics"))).unwrap();
+        app.lyrics_response = Some((track_a, rx));
+        let _ = app.current_lyrics();
+
+        // Track B's lyrics must remain completely untouched, and the stale receiver is cleared.
+        assert!(app.lyrics_response.is_none());
+        assert_eq!(app.lyrics_for, Some(track_b));
+        assert_eq!(
+            app.lyrics.as_ref().and_then(|l| l.lines.first()).map(|l| l.text.as_str()),
+            Some("Current track B lyrics")
+        );
+
+        // Now a response matching the active Track B DOES update lyrics cleanly.
+        let (tx2, rx2) = mpsc::channel();
+        tx2.send(Some(Lyrics::parse("[00:03.00] Fresh track B lyrics"))).unwrap();
+        app.lyrics_response = Some((track_b, rx2));
+        let _ = app.current_lyrics();
+        assert_eq!(
+            app.lyrics.as_ref().and_then(|l| l.lines.first()).map(|l| l.text.as_str()),
+            Some("Fresh track B lyrics")
+        );
+        app.engine.stop();
+    }
+
+    #[test]
+    fn finish_frame_sleeps_indefinitely_when_idle_and_clean_but_wakes_for_pending_saves() {
+        let mut app = test_app();
+        app.dirty = false;
+        app.library_dirty = false;
+        app.can_save_user = true;
+        app.toast = None;
+        app.seek_drag = None;
+        // Completely idle and clean => zero periodic background wakeups.
+        assert_eq!(app.next_frame_repaint_wait(), None);
+
+        // Unsaved user data => wakes once the 5s debounce window elapses.
+        app.dirty = true;
+        app.last_save = Instant::now();
+        let wait = app.next_frame_repaint_wait().expect("dirty app must schedule save flush");
+        assert!(wait >= Duration::from_millis(250) && wait <= Duration::from_secs(5));
+
+        // Active toast => wakes every 250ms until expiry.
+        app.dirty = false;
+        app.toast = Some(("Saved".into(), Instant::now()));
+        assert_eq!(app.next_frame_repaint_wait(), Some(Duration::from_millis(250)));
         app.engine.stop();
     }
 }

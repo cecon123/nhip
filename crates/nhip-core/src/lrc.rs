@@ -1,23 +1,51 @@
-//! Lyrics shared by LRC, plain text, and TTML.
+//! Lyrics shared by LRC, plain text, TTML, LyricsPlus, and Spicy Lyrics API.
 
 use std::ops::Range;
 
-#[derive(Clone)]
+use serde::{Deserialize, Serialize};
+
+/// Verified from Spicy Lyrics `src/utils/Lyrics/lyrics.ts:12` (`getLyricsBetweenShow()` = 3s).
+pub const INTERLUDE_GAP_MS: u64 = 3_000;
+/// Minimum post-vocal gap required to infer an instrumental interlude on plain LRC lines lacking `end_ms`.
+pub const LRC_INFERRED_INTERLUDE_GAP_MS: u64 = 4_000;
+/// Conservative outro gap threshold so short track fadeouts do not flash spurious dots.
+pub const OUTRO_INTERLUDE_GAP_MS: u64 = 5_000;
+
+/// Returns `(end_ms, inferred)` for a vocal line. When `end_ms` and syllable `spans` are absent
+/// (standard LRC / LRCLIB line-synced files), estimates vocal finish time from character length
+/// so genuine instrumental breaks produce 3-dot interludes without false positives on slow ballads.
+fn effective_line_end_ms(line: &LyricLine) -> Option<(u64, bool)> {
+    if let Some(end) = line.end_ms {
+        return Some((end, false));
+    }
+    if let Some(last) = line.spans.last() {
+        return Some((last.end_ms, false));
+    }
+    let start = line.time_ms?;
+    let chars = line.text.trim().chars().count() as u64;
+    let est_dur = (1_800 + chars.saturating_mul(135)).clamp(2_600, 8_500);
+    Some((start.saturating_add(est_dur), true))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimedSpan {
     pub bytes: Range<usize>,
     pub start_ms: u64,
     pub end_ms: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LyricLine {
     pub time_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub text: String,
+    #[serde(default)]
     pub spans: Vec<TimedSpan>,
-    /// Secondary / opposite vocalist (`v2` in LyricsPlus / Apple TTML), right-aligned like Spicy Lyrics.
+    /// Secondary / opposite vocalist (`OppositeAligned` in Spicy Lyrics / `v2` in LyricsPlus / Apple TTML).
+    #[serde(default)]
     pub right_align: bool,
-    /// Background vocal / ad-lib (`isBackground: true` in LyricsPlus), rendered smaller below parent line.
+    /// Background vocal / ad-lib (`Background` in Spicy Lyrics / `isBackground` in LyricsPlus), rendered smaller below parent line.
+    #[serde(default)]
     pub background: bool,
 }
 
@@ -34,12 +62,87 @@ impl LyricLine {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LyricsContributor {
+    pub id: String,
+    pub username: String,
+    pub url: String,
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+/// Community attribution required by Spicy Lyrics Terms of Service Section 6 when `source == "spicy_lyrics"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LyricsAttribution {
+    pub uploader: LyricsContributor,
+    #[serde(default)]
+    pub maker: Option<LyricsContributor>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LyricsTrackIds {
+    #[serde(default)]
+    pub spotify: Option<String>,
+    #[serde(default)]
+    pub isrc: Option<String>,
+    #[serde(default)]
+    pub apple_music: Option<String>,
+    #[serde(default)]
+    pub tidal: Option<String>,
+    #[serde(default)]
+    pub youtube: Option<String>,
+}
+
+/// Virtual interlude generated from qualifying timeline gaps or explicit instrumental markers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterludeEvent {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub right_align: bool,
+}
+
+/// Unified lyrics timeline item participating in layout, scrolling, and focus distance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LyricsEvent {
+    VocalLine(usize),
+    Interlude(InterludeEvent),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lyrics {
     pub lines: Vec<LyricLine>,
     pub synced: bool,
+    #[serde(default)]
     pub songwriter: Option<String>,
+    #[serde(skip)]
     pub provider: Option<&'static str>,
+    /// Canonical upstream catalogue identifier (`"spicy_lyrics"`, `"apple_music"`, `"spotify"`, `"lrclib"`, etc.).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Present ONLY when `source == "spicy_lyrics"`. Absent for commercial catalogues.
+    #[serde(default)]
+    pub attribution: Option<LyricsAttribution>,
+    #[serde(default)]
+    pub track_ids: Option<LyricsTrackIds>,
+}
+
+/// Maps a canonical source key back to its static display provider name (also used on cache restore).
+pub fn provider_label_for_source(source: &str) -> &'static str {
+    match source.trim().to_ascii_lowercase().as_str() {
+        "spicy_lyrics" | "spicylyrics" => "Spicy Lyrics",
+        "apple_music" | "apple" | "apple music" => "Apple Music",
+        "spotify" => "Spotify",
+        "musixmatch" | "musixmatch-word" => "Musixmatch",
+        "lrclib" => "LRCLIB",
+        "youtube" | "youtube music" => "YouTube Music",
+        "ttml" => "TTML",
+        _ => "LyricsPlus",
+    }
+}
+
+pub fn is_instrumental_text(text: &str) -> bool {
+    let t = text.trim();
+    t.is_empty() || matches!(t, "♪" | "♫" | "♬" | "..." | "…" | "• • •" | "•••")
 }
 
 impl Lyrics {
@@ -87,6 +190,9 @@ impl Lyrics {
                 synced: false,
                 songwriter: None,
                 provider: None,
+                source: None,
+                attribution: None,
+                track_ids: None,
             };
         }
         timed.sort_by_key(|l| l.time_ms);
@@ -106,7 +212,184 @@ impl Lyrics {
             synced: true,
             songwriter: None,
             provider: None,
+            source: None,
+            attribution: None,
+            track_ids: None,
         }
+    }
+
+    /// Rehydrates the static `provider` label from `source` after deserializing from disk cache.
+    pub fn restore_provider_label(&mut self) {
+        if self.provider.is_none() {
+            if let Some(ref src) = self.source {
+                self.provider = Some(provider_label_for_source(src));
+            }
+        }
+    }
+
+    /// Builds the unified timeline of vocal lines and virtual `InterludeEvent`s from qualifying
+    /// gaps (`>= INTERLUDE_GAP_MS` = 3000ms, matching Spicy Lyrics `getLyricsBetweenShow()`).
+    ///
+    /// Rules:
+    /// - Static (unsynced) lyrics emit only `VocalLine` events (never interludes).
+    /// - Intro gap (`0..first_vocal_ms >= 3000ms`) emits one intro `InterludeEvent` unless an
+    ///   explicit instrumental line already precedes it.
+    /// - Consecutive explicit instrumental/blank lines collapse into one `InterludeEvent`
+    ///   (dropping tiny `< 2200ms` blank LRC spacers).
+    /// - Mid-song gaps (`next_main.start_ms - prev_group_end_ms >= 3000ms`, where
+    ///   `prev_group_end_ms` accounts for any overlapping trailing background vocals) emit one
+    ///   `InterludeEvent` aligned to the upcoming vocal line's `right_align`.
+    /// - Outro gap (`track_duration_ms - last_vocal_end_ms >= 5000ms`) emits an outro interlude
+    ///   only when valid track duration data is supplied.
+    pub fn build_timeline(&self, track_duration_ms: Option<u64>) -> Vec<LyricsEvent> {
+        if !self.synced {
+            return (0..self.lines.len()).map(LyricsEvent::VocalLine).collect();
+        }
+        let mut events = Vec::with_capacity(self.lines.len() + 4);
+        let first_vocal = self
+            .lines
+            .iter()
+            .find(|l| !l.background && !is_instrumental_text(&l.text) && l.time_ms.is_some());
+
+        if let Some(fv) = first_vocal {
+            if let Some(first_ms) = fv.time_ms {
+                let has_explicit_intro = self.lines.iter().any(|l| {
+                    is_instrumental_text(&l.text) && l.time_ms.is_some_and(|t| t < first_ms)
+                });
+                if !has_explicit_intro && first_ms >= INTERLUDE_GAP_MS {
+                    events.push(LyricsEvent::Interlude(InterludeEvent {
+                        start_ms: 0,
+                        end_ms: first_ms,
+                        right_align: fv.right_align,
+                    }));
+                }
+            }
+        }
+
+        let mut i = 0usize;
+        while i < self.lines.len() {
+            let line = &self.lines[i];
+            if is_instrumental_text(&line.text) {
+                if let Some(start_ms) = line.time_ms {
+                let mut run_end = i;
+                let mut explicit_symbol = !line.text.trim().is_empty();
+                while let Some(next) = self.lines.get(run_end + 1) {
+                    if is_instrumental_text(&next.text) && next.time_ms.is_some() {
+                        explicit_symbol |= !next.text.trim().is_empty();
+                        run_end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let next_vocal = self.lines.get(run_end + 1);
+                let next_vocal_ms = next_vocal.and_then(|n| n.time_ms);
+                let end_ms = self.lines[run_end]
+                    .end_ms
+                    .or(next_vocal_ms)
+                    .unwrap_or(start_ms + 4_000)
+                    .max(start_ms + 500);
+                if explicit_symbol || end_ms.saturating_sub(start_ms) >= 2_200 {
+                    // Avoid pushing a duplicate overlapping interlude immediately after another.
+                    let duplicate = matches!(
+                        events.last(),
+                        Some(LyricsEvent::Interlude(prev)) if prev.end_ms >= start_ms
+                    );
+                    if !duplicate {
+                        events.push(LyricsEvent::Interlude(InterludeEvent {
+                            start_ms,
+                            end_ms,
+                            right_align: next_vocal.is_some_and(|n| n.right_align),
+                        }));
+                    }
+                }
+                i = run_end + 1;
+                continue;
+                }
+            }
+
+            events.push(LyricsEvent::VocalLine(i));
+
+            // If this is a main vocal line, also emit its immediately following background vocals
+            // before evaluating any interlude gap to the next main vocal line.
+            if !line.background {
+                let mut group_end = effective_line_end_ms(line);
+                let mut j = i + 1;
+                let mut has_explicit_gap = false;
+                while let Some(cand) = self.lines.get(j) {
+                    if is_instrumental_text(&cand.text) && cand.time_ms.is_some() {
+                        has_explicit_gap = true;
+                        break;
+                    }
+                    if cand.background {
+                        events.push(LyricsEvent::VocalLine(j));
+                        if let Some((bg_end, bg_inf)) = effective_line_end_ms(cand) {
+                            group_end = Some(match group_end {
+                                Some((cur_end, cur_inf)) => {
+                                    if bg_end > cur_end {
+                                        (bg_end, bg_inf)
+                                    } else {
+                                        (cur_end, cur_inf)
+                                    }
+                                }
+                                None => (bg_end, bg_inf),
+                            });
+                        }
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !has_explicit_gap {
+                    if let (Some((end_ms, inferred)), Some(next_main)) =
+                        (group_end, self.lines.get(j))
+                    {
+                        if let Some(next_start) = next_main.time_ms {
+                            let min_gap = if inferred {
+                                LRC_INFERRED_INTERLUDE_GAP_MS
+                            } else {
+                                INTERLUDE_GAP_MS
+                            };
+                            if next_start >= end_ms.saturating_add(min_gap) {
+                                events.push(LyricsEvent::Interlude(InterludeEvent {
+                                    start_ms: end_ms,
+                                    end_ms: next_start,
+                                    right_align: next_main.right_align,
+                                }));
+                            }
+                        }
+                    }
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Optional outro interlude only when track duration is known and leaves a long instrumental tail.
+        if let Some(dur_ms) = track_duration_ms.filter(|&d| d > 0) {
+            let last_vocal_end = self
+                .lines
+                .iter()
+                .filter(|l| !is_instrumental_text(&l.text))
+                .filter_map(effective_line_end_ms)
+                .map(|(end, _)| end)
+                .max();
+            if let Some(last_end) = last_vocal_end {
+                let already_has_outro = matches!(
+                    events.last(),
+                    Some(LyricsEvent::Interlude(ev)) if ev.start_ms >= last_end
+                );
+                if !already_has_outro && dur_ms >= last_end.saturating_add(OUTRO_INTERLUDE_GAP_MS) {
+                    events.push(LyricsEvent::Interlude(InterludeEvent {
+                        start_ms: last_end,
+                        end_ms: dur_ms,
+                        right_align: false,
+                    }));
+                }
+            }
+        }
+
+        events
     }
 
     /// The line being sung at `position_ms`.
@@ -279,5 +562,107 @@ mod tests {
         assert_eq!(l.lines.len(), 2);
         assert_eq!(l.lines[0].text, "Mùa đông ghé tới");
         assert_eq!(l.lines[1].text, "Bút Chì Bạc");
+    }
+
+    #[test]
+    fn build_timeline_generates_intro_mid_outro_interludes_without_duplicates_or_bg_splits() {
+        let mk = |start: u64, end: u64, text: &str, bg: bool, right: bool| LyricLine {
+            time_ms: Some(start),
+            end_ms: Some(end),
+            text: text.to_string(),
+            spans: Vec::new(),
+            right_align: right,
+            background: bg,
+        };
+        let lyrics = Lyrics {
+            lines: vec![
+                // Intro gap 0..4500 (>= 3000) -> intro interlude right_align=false
+                mk(4_500, 7_000, "Line 1", false, false),
+                // Background vocal extends group end to 9_200, so gap to Line 2 (11_500) is only 2_300 (< 3000) -> NO interlude!
+                mk(6_800, 9_200, "bg adlib", true, false),
+                mk(11_500, 14_000, "Line 2", false, false),
+                // Gap 14_000..18_500 = 4_500 (>= 3000) -> mid interlude inheriting right_align=true from Line 3!
+                mk(18_500, 21_000, "Line 3 duet", false, true),
+                // Consecutive explicit instrumental markers collapse to a single interlude
+                mk(21_200, 24_000, "", false, false),
+                mk(24_000, 27_000, "♪", false, false),
+                mk(27_500, 30_000, "Final line", false, false),
+            ],
+            synced: true,
+            songwriter: None,
+            provider: None,
+            source: None,
+            attribution: None,
+            track_ids: None,
+        };
+
+        // Without track duration: no outro interlude
+        let tl_no_dur = lyrics.build_timeline(None);
+        assert_eq!(
+            tl_no_dur,
+            vec![
+                LyricsEvent::Interlude(InterludeEvent { start_ms: 0, end_ms: 4_500, right_align: false }),
+                LyricsEvent::VocalLine(0),
+                LyricsEvent::VocalLine(1),
+                LyricsEvent::VocalLine(2),
+                LyricsEvent::Interlude(InterludeEvent { start_ms: 14_000, end_ms: 18_500, right_align: true }),
+                LyricsEvent::VocalLine(3),
+                LyricsEvent::Interlude(InterludeEvent { start_ms: 21_200, end_ms: 27_000, right_align: false }),
+                LyricsEvent::VocalLine(6),
+            ]
+        );
+
+        // With 38s track duration (8s tail >= 5s): outro interlude appended
+        let tl_with_outro = lyrics.build_timeline(Some(38_000));
+        assert_eq!(
+            tl_with_outro.last(),
+            Some(&LyricsEvent::Interlude(InterludeEvent {
+                start_ms: 30_000,
+                end_ms: 38_000,
+                right_align: false,
+            }))
+        );
+
+        // Static lyrics never produce interludes
+        let static_lyrics = Lyrics::parse("Plain line 1\nPlain line 2");
+        assert_eq!(
+            static_lyrics.build_timeline(Some(120_000)),
+            vec![LyricsEvent::VocalLine(0), LyricsEvent::VocalLine(1)]
+        );
+    }
+
+    #[test]
+    fn build_timeline_infers_interludes_for_plain_lrc_instrumental_breaks_without_false_positives() {
+        let lrc = Lyrics::parse(concat!(
+            "[00:02.19]One, two, three, yah\n",
+            "[00:24.44]Dường như em đã quen khi anh chẳng ghé qua (anh chẳng ghé qua)\n",
+            "[00:34.01]Cùng thật nhiều lý do nhưng anh chọn nói ra (anh chọn nói ra)\n",
+            "[00:41.49]Rằng anh không còn niềm tin vào tình yêu dù cho em đang bên cạnh\n",
+            "[00:50.85]Người đàn ông mà em yêu dù giông bão em vẫn đứng ngay bên cạnh\n",
+            "[01:00.92]Em sẽ không ở mãi nơi đây đợi anh mỗi ngày\n",
+            "[01:26.80]Dường như anh đã quen với những ngày có em (những ngày có em)\n",
+        ));
+        let tl = lrc.build_timeline(Some(110_000));
+        // Must infer interludes for the real 22s intro break, the 26s mid-song break, and the outro tail,
+        // while NEVER inserting spurious interludes between consecutive long 9.5s–10.0s ballad lines.
+        let interludes: Vec<InterludeEvent> = tl
+            .iter()
+            .filter_map(|e| match *e {
+                LyricsEvent::Interlude(ev) => Some(ev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interludes.len(), 3, "expected 3 real instrumental breaks, got {interludes:?}");
+        assert_eq!(interludes[0].end_ms, 24_440, "first break must end cleanly when vocal line 1 starts");
+        assert!(interludes[0].start_ms > 2_190 && interludes[0].start_ms < 10_000);
+        assert_eq!(interludes[1].end_ms, 86_800, "mid-song break must end cleanly when verse 2 starts");
+        assert!(interludes[1].start_ms > 60_920 && interludes[1].start_ms < 72_000);
+        assert_eq!(interludes[2].end_ms, 110_000, "outro tail interlude must reach track duration");
+        // Verify lines 1..=5 sit consecutively with no spurious interlude between them.
+        let pos_1 = tl.iter().position(|e| *e == LyricsEvent::VocalLine(1)).unwrap();
+        assert_eq!(tl[pos_1 + 1], LyricsEvent::VocalLine(2));
+        assert_eq!(tl[pos_1 + 2], LyricsEvent::VocalLine(3));
+        assert_eq!(tl[pos_1 + 3], LyricsEvent::VocalLine(4));
+        assert_eq!(tl[pos_1 + 4], LyricsEvent::VocalLine(5));
     }
 }

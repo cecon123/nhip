@@ -8,7 +8,7 @@ use eframe::egui::{
 use super::icons::{self, Icon, SpicyIcon};
 use super::widgets::{
     cover, cover_shadow, icon_button_sized, marquee_text, mmss, skeleton_glass_rect, text,
-    text_width,
+    text_width, GlassCard,
 };
 use crate::app::{Action, App, Route, TtmlImportMode};
 use crate::library::{fold, imported_lyrics_file, split_artists, Track, TrackId};
@@ -16,16 +16,27 @@ use crate::lrc::{LyricLine, Lyrics};
 use crate::queue::Repeat;
 use crate::theme::{
     body, bold, marginal, marginal_small, semi, ACCENT, CARD, ELEVATED, HAIRLINE, HOVER, MUTED,
-    POPUP, RADIUS_MODAL, SUBTLE, TEXT,
+    NPV_SECTION_GAP, NPV_SIDE_INSET, POPUP, RADIUS_MODAL, SUBTLE, TEXT,
 };
 
-const CARD_GLASS_BG: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
+// Verified against Spikerko/spicy-lyrics @ 1c02f47cd64ed8c34bb76dd8ff00755db9d1d66f
+// (`Mixed.css`, `LyricsAnimator.ts`, `ScrollToActiveLine.ts`, `Shared.ts`, `lyrics.ts`).
+const PAST_SUNG_WHITE: Color32 = Color32::from_rgba_premultiplied(74, 74, 74, 74); // ~0.29
+const MANUAL_SCROLL_RESUME_SECS: f64 = 0.75; // `ScrollToActiveLine.ts:49` `USER_SCROLL_COOLDOWN`
 
-// Reference: spicy-lyrics-f000506.js 6.4.70, LF SHA-256 805c63a94121b748f99f91d5936c419d0810d8d318b204e13850c98ec20a6abc.
-// Measurements and selectors: .scratch/rea-spotify/pages-and-lyrics-flows.md section 5.
-const ACTIVE_UNSUNG_WHITE: Color32 = Color32::from_rgba_premultiplied(112, 112, 112, 112); // ~0.44
-const PAST_SUNG_WHITE: Color32 = Color32::from_rgba_premultiplied(102, 102, 102, 102); // ~0.40
-const MANUAL_SCROLL_RESUME_SECS: f64 = 0.75;
+/// Playback-derived visual state for a single lyric line.
+/// Strictly independent of hover state and manual scroll state:
+/// - Hover NEVER changes blur, opacity, glow, or active focus.
+/// - Manual scroll NEVER removes blur, boosts opacity, or shifts active focus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LyricVisualState {
+    is_active: bool,
+    opacity: f32,
+    lift_px: f32,
+    scale: f32,
+    blur_sigma_pt: f32,
+    glow_strength: f32,
+}
 
 #[derive(Clone, Default)]
 struct LyricsHoverPillState {
@@ -91,10 +102,19 @@ impl LyricsHoverPillState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingLyricSeek {
+    line_index: usize,
+    target_ms: u64,
+    origin_pos_ms: u64,
+    clicked_at: f64,
+}
+
 #[derive(Clone, Default)]
 struct LyricsFollowState {
     track: Option<TrackId>,
     last_active: Option<usize>,
+    last_active_event: Option<usize>,
     manual_scroll_at: Option<f64>,
     active_visible: bool,
     last_position: Option<u64>,
@@ -102,9 +122,46 @@ struct LyricsFollowState {
     last_scroll_y: f32,
     anim_target_y: Option<f32>,
     programmatic_y: Option<f32>,
+    pending_seek: Option<PendingLyricSeek>,
 }
 
 impl LyricsFollowState {
+    /// Holds click-to-seek focus on the clicked lyric line while async `Cmd::Seek` and coarse
+    /// packet/keyframe audio seeks settle, preventing the preceding line above from flashing first.
+    fn resolve_effective_pos(
+        &mut self,
+        now: f64,
+        position: u64,
+        playing: bool,
+    ) -> (u64, Option<usize>) {
+        let Some(ps) = self.pending_seek else {
+            return (position, None);
+        };
+        let elapsed = now - ps.clicked_at;
+        if elapsed < 0.0 || (playing && elapsed >= 2.2) {
+            self.pending_seek = None;
+            return (position, None);
+        }
+        // Release immediately if the user scrubbed elsewhere on the timeline bar.
+        if elapsed > 0.25
+            && position.abs_diff(ps.target_ms) > 2_500
+            && position.abs_diff(ps.origin_pos_ms) > 1_000
+        {
+            self.pending_seek = None;
+            return (position, None);
+        }
+        if position >= ps.target_ms {
+            let seeking_backward = ps.target_ms < ps.origin_pos_ms;
+            let still_stale_pre_seek =
+                seeking_backward && elapsed < 0.45 && position + 200 >= ps.origin_pos_ms;
+            if !still_stale_pre_seek {
+                self.pending_seek = None;
+                return (position, None);
+            }
+        }
+        (ps.target_ms, Some(ps.line_index))
+    }
+
     fn resume_follow(&mut self, now: f64, position: u64, playing: bool, manual_input: bool) -> bool {
         // Bundle rb()/eb(): a >1000ms seek or playback change releases manual browsing.
         let transport_changed = self.last_position.is_some_and(|p| p.abs_diff(position) > 1000)
@@ -119,6 +176,7 @@ impl LyricsFollowState {
         }) {
             self.manual_scroll_at = None;
             self.last_active = None;
+            self.last_active_event = None;
             return true;
         }
         false
@@ -164,6 +222,17 @@ impl BackdropState {
         }
         t
     }
+
+    /// Advances Kawarp wave phase only while playback is active; returns `true` only when the
+    /// backdrop still needs continuous repaints (active playback drift or in-flight crossfade).
+    fn advance_phase(&mut self, dt: f32, motion_on: bool, playing: bool) -> bool {
+        let drift_active = motion_on && playing;
+        if drift_active {
+            let speed = 1.40 + 0.35 * (self.phase * 0.7).sin();
+            self.phase = (self.phase + dt * speed) % (std::f32::consts::TAU * 64.0);
+        }
+        drift_active || self.blend < 1.0
+    }
 }
 
 #[derive(Clone)]
@@ -198,7 +267,18 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
             None,
         )
     };
-    let animating_backdrop = draw_animated_backdrop(
+    let cinema_mode = app.lyrics_cinema || app.lyrics_fullscreen.is_some();
+    let obscured_by_cinema_slide = !cinema_mode
+        && ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(egui::Id::NULL.with("cinema-slide-obscuring")))
+            .unwrap_or(false);
+    if obscured_by_cinema_slide {
+        ui.painter().rect_filled(bounds, 0.0, target_colors[1]);
+        return;
+    }
+
+    let (animating_backdrop, _) = draw_animated_backdrop(
         ui,
         bounds,
         track_id,
@@ -206,13 +286,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
         backdrop_tex,
         motion_on && lyrics_visible,
         playing,
+        false,
     );
 
     if track_id.is_some() {
         let _ = app.current_lyrics();
     }
-
-    let cinema_mode = app.lyrics_cinema || app.lyrics_fullscreen.is_some();
 
     if cinema_mode || app.lyrics_split_nowbar {
         draw_cinema_stage(app, ui, bounds, track.as_ref(), position, motion_on, cinema_mode);
@@ -224,13 +303,14 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
         draw_view_controls(app, ui, bounds, false, 1.0, motion_on);
     }
 
-    // Repaint scheduling: keep Kawarp dynamic backdrop & lyric sweep fluid at ~60fps without spinning 100% CPU.
+    // Repaint scheduling: keep Kawarp dynamic backdrop & lyric sweep fluid at ~60fps while playing
+    // or crossfading, without spinning GPU/CPU when paused & settled.
     let synced_playing = playing
         && app
             .current_lyrics()
             .is_some_and(|l| l.synced);
-    if lyrics_visible && (animating_backdrop || synced_playing || motion_on) {
-        if motion_on && (animating_backdrop || synced_playing) {
+    if lyrics_visible && (animating_backdrop || synced_playing) {
+        if motion_on {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         } else {
             ui.ctx().request_repaint_after(Duration::from_millis(42));
@@ -257,28 +337,18 @@ pub fn card(app: &mut App, ui: &mut Ui) {
     let track_id = app.player.current;
 
     ui.horizontal(|ui| {
-        let inset = if expanded { 0.0 } else { 16.0 };
+        let inset = if expanded { 0.0 } else { NPV_SIDE_INSET };
         ui.add_space(inset);
         let width = (ui.available_width() - inset).max(0.0);
-        let frame = if expanded {
-            egui::Frame::new()
-                .fill(Color32::TRANSPARENT)
-                .inner_margin(egui::Margin::ZERO)
-        } else {
-            egui::Frame::new()
-                .fill(CARD_GLASS_BG)
-                .corner_radius(CornerRadius::same(16))
-                .inner_margin(egui::Margin::ZERO)
-        };
 
-        frame.show(ui, |ui| {
+        let render_card_inner = |ui: &mut Ui| {
             let inner_w = width;
             ui.vertical(|ui| {
                 ui.set_width(inner_w);
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let card_bounds = ui.max_rect();
                 let card_hovered = ui.rect_contains_pointer(card_bounds);
-                // live-home-measurements.json (1304x724, DPR 1.25): 301 = 8 + 38 + 255 CSS px.
+                // `NPVLyrics.css`: header (8px top + 38px row) + 255px compact body.
                 if !expanded {
                     ui.add_space(8.0);
                     egui::Frame::new()
@@ -289,6 +359,9 @@ pub fn card(app: &mut App, ui: &mut Ui) {
                 }
 
                 if collapsed {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::NULL.with("npv-nested-lyrics-hovered"), false);
+                    });
                     ui.add_space(8.0);
                     return;
                 }
@@ -309,7 +382,12 @@ pub fn card(app: &mut App, ui: &mut Ui) {
 
                 let _ = app.current_lyrics();
                 let is_loading = app.lyrics_loading();
-                let cur_artist = app.current_track().map(|t| t.artist.clone()).unwrap_or_default();
+                let track_snapshot = app.current_track();
+                let cur_artist = track_snapshot
+                    .as_ref()
+                    .map(|t| t.artist.clone())
+                    .unwrap_or_default();
+                let track_dur_ms = track_snapshot.as_ref().map(|t| t.duration_ms);
                 let mut seek_action: Option<u64> = None;
                 let mut repaint_ms: Option<u64> = None;
 
@@ -319,7 +397,17 @@ pub fn card(app: &mut App, ui: &mut Ui) {
                         Vec2::new(inner_w, body_height),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                            let body_rect = ui.max_rect();
+                            ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+                            let nested_hov = !expanded
+                                && lyrics_opt.is_some()
+                                && ui.rect_contains_pointer(body_rect);
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(
+                                    egui::Id::NULL.with("npv-nested-lyrics-hovered"),
+                                    nested_hov,
+                                );
+                            });
                             let Some(lyrics) = lyrics_opt else {
                                 if is_loading {
                                     draw_lyrics_skeleton(ui, inner_w, body_height, 16.0, 18.0);
@@ -337,7 +425,7 @@ pub fn card(app: &mut App, ui: &mut Ui) {
                             };
 
                             if playing && lyrics.synced {
-                                repaint_ms = Some(if motion_on { 24 } else { 48 });
+                                repaint_ms = Some(if motion_on { 16 } else { 48 });
                             }
 
                             // `NPVLyrics.css:492` (`clamp(1.85rem, 6cqw, 2.8rem)`) & `.Expanded` (`NPVLyrics.css:366`).
@@ -349,16 +437,16 @@ pub fn card(app: &mut App, ui: &mut Ui) {
                             let line_inset = if expanded {
                                 (inner_w * 0.07).clamp(16.0, 32.0)
                             } else {
-                                16.0
+                                20.0
                             };
-                            let credits = expanded
-                                .then(|| resolve_lyrics_credits(lyrics, &cur_artist))
-                                .flatten();
+                            // Always supply credits/attribution with lyrics (Spicy Lyrics ToS Section 6).
+                            let credits = resolve_lyrics_credits(lyrics, &cur_artist);
                             seek_action = render_lyrics_scroll_body(
                                 ui,
                                 "npv-lyrics-card-scroll",
                                 lyrics,
                                 track_id,
+                                track_dur_ms,
                                 position,
                                 playing,
                                 motion_on,
@@ -393,10 +481,19 @@ pub fn card(app: &mut App, ui: &mut Ui) {
                     draw_card_header(app, &mut header, expanded, collapsed, motion_on, true);
                 }
             });
-        });
+        };
+
+        if expanded {
+            egui::Frame::new()
+                .fill(Color32::TRANSPARENT)
+                .inner_margin(egui::Margin::ZERO)
+                .show(ui, render_card_inner);
+        } else {
+            GlassCard::lyrics().show(ui, render_card_inner);
+        }
     });
     if !expanded {
-        ui.add_space(12.0);
+        ui.add_space(NPV_SECTION_GAP);
     }
 }
 
@@ -508,7 +605,12 @@ fn draw_center_lyrics(
 
     let _ = app.current_lyrics();
     let is_loading = app.lyrics_loading();
-    let cur_artist = app.current_track().map(|t| t.artist.clone()).unwrap_or_default();
+    let track_snapshot = app.current_track();
+    let cur_artist = track_snapshot
+        .as_ref()
+        .map(|t| t.artist.clone())
+        .unwrap_or_default();
+    let track_dur_ms = track_snapshot.as_ref().map(|t| t.duration_ms);
     let playing = app.is_playing();
     let mut target = None;
 
@@ -544,7 +646,7 @@ fn draw_center_lyrics(
             (bounds.width() * 0.165).clamp(32.0, 165.0)
         };
         let content_w = (bounds.width() - 2.0 * padding).min(720.0).max(160.0);
-        // `Lyrics/main.css:36` & `Mixed.css:263` (`--DefaultLyricsScale: 0.95` -> ~31.8px at 684px panel width, matching `1e971dbd.jpg` word wrap).
+        // `Lyrics/main.css:36` & `Mixed.css:263` (`--DefaultLyricsScale: 0.95` -> ~31.8px at 684px panel width).
         let font_size = if cinema {
             (bounds.width() * 0.052).clamp(28.5, 44.0)
         } else {
@@ -562,6 +664,7 @@ fn draw_center_lyrics(
                 },
                 lyrics,
                 track_id,
+                track_dur_ms,
                 position,
                 playing,
                 motion_on,
@@ -1912,6 +2015,7 @@ fn render_lyrics_scroll_body(
     salt: &str,
     lyrics: &Lyrics,
     track_id: Option<TrackId>,
+    track_duration_ms: Option<u64>,
     position: u64,
     playing: bool,
     motion_on: bool,
@@ -1927,12 +2031,6 @@ fn render_lyrics_scroll_body(
 ) -> Option<u64> {
     let is_popup = salt == "spicy-popup-scroll";
     let is_line_only = lyrics.synced && lyrics.lines.iter().all(|l| l.spans.is_empty());
-    let eff_pos = if playing && is_line_only {
-        position.saturating_sub(85)
-    } else {
-        position
-    };
-    let active = lyrics.display_current(eff_pos);
     let follow_id = ui.scope_id().with(salt).with("follow");
     let now = ui.input(|i| i.time);
     let dt = ui.input(|i| i.unstable_dt).clamp(0.001, 0.05);
@@ -1945,6 +2043,36 @@ fn render_lyrics_scroll_body(
             active_visible: true,
             ..Default::default()
         });
+
+    let (eff_pos, pinned_seek_line) = follow.resolve_effective_pos(now, position, playing);
+    let timeline = lyrics.build_timeline(track_duration_ms);
+    let active_interlude = if lyrics.synced && pinned_seek_line.is_none() {
+        timeline.iter().enumerate().find_map(|(ev_i, ev)| match ev {
+            crate::lrc::LyricsEvent::Interlude(inter)
+                if eff_pos >= inter.start_ms && eff_pos < inter.end_ms =>
+            {
+                Some((ev_i, *inter))
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let raw_active = pinned_seek_line
+        .filter(|&idx| idx < lyrics.lines.len())
+        .or_else(|| lyrics.display_current(eff_pos));
+    let active_vocal = if active_interlude.is_some() {
+        None
+    } else {
+        raw_active
+    };
+    let active_event = active_interlude.map(|(ev_i, _)| ev_i).or_else(|| {
+        active_vocal.and_then(|v| {
+            timeline
+                .iter()
+                .position(|ev| matches!(ev, crate::lrc::LyricsEvent::VocalLine(i) if *i == v))
+        })
+    });
 
     let area_rect = ui.available_rect_before_wrap();
     let area_rect = Rect::from_min_size(area_rect.min, Vec2::new(total_width, height));
@@ -1966,6 +2094,11 @@ fn render_lyrics_scroll_body(
         .ctx()
         .data(|d| d.get_temp::<bool>(egui::Id::NULL.with("lyrics-force-manual-scroll")))
         .unwrap_or(false);
+    let force_hover_line = ui
+        .ctx()
+        .data(|d| d.get_temp::<Option<usize>>(egui::Id::NULL.with("lyrics-force-hover-line")))
+        .flatten();
+
     // Process timeline seek / playback resume BEFORE deciding scroll target so scrubbing syncs immediately!
     let resumed_now = follow.resume_follow(now, position, playing, manual_input && lyrics.synced);
     if force_manual_offscreen && lyrics.synced {
@@ -1976,22 +2109,27 @@ fn render_lyrics_scroll_body(
     let first_vocal_ms = lyrics
         .lines
         .iter()
-        .find(|l| !l.background && !is_instrumental_line(&l.text))
+        .find(|l| !l.background && !crate::lrc::is_instrumental_text(&l.text))
         .and_then(|l| l.time_ms);
     let in_intro = lyrics.synced && first_vocal_ms.is_some_and(|ms| eff_pos < ms);
 
+    // Manual scroll ONLY suspends viewport auto-follow — it NEVER removes blur, boosts opacity, or changes lyric focus!
     let manual_paused = follow.manual_scroll_at.is_some();
-    let hide_blur = manual_paused;
-    // ONLY reset scroll to 0.0 during a true intro (before first vocal line) — NEVER mid-song!
-    let needs_intro_reset = !manual_paused && in_intro && follow.last_active.is_some();
+    let needs_intro_reset =
+        !manual_paused && in_intro && active_interlude.is_none() && follow.last_active.is_some();
+    let has_active_target = active_vocal.is_some() || active_interlude.is_some();
     let wants_recenter = !manual_paused
         && lyrics.synced
-        && active.is_some()
-        && (resumed_now || active != follow.last_active || !follow.active_visible);
+        && has_active_target
+        && (resumed_now
+            || raw_active != follow.last_active
+            || active_event != follow.last_active_event
+            || !follow.active_visible);
     if needs_intro_reset {
         follow.anim_target_y = Some(0.0);
     }
-    follow.last_active = active;
+    follow.last_active = raw_active;
+    follow.last_active_event = active_event;
 
     let mut seek_target: Option<u64> = None;
     let mut sync_clicked = false;
@@ -2018,358 +2156,489 @@ fn render_lyrics_scroll_body(
     follow.programmatic_y = applied_scroll_y;
 
     // Key the ScrollArea by `track_id` so switching songs NEVER inherits the previous song's bottom scroll offset!
-    let mut scroll_area = egui::ScrollArea::vertical()
-        .id_salt((salt, track_id))
-        .max_height(height)
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-        .scroll_source(egui::scroll_area::ScrollSource::ALL)
-        .auto_shrink([false, false])
-        .animated(false);
-    if let Some(y) = applied_scroll_y {
-        scroll_area = scroll_area.vertical_scroll_offset(y);
-    }
-    let scroll_out = scroll_area.show(ui, |ui| {
-            let content_origin_y = ui.cursor().top();
-            let lead_space = if !lyrics.synced {
-                if compact_card { 12.0 } else { 64.0 }
-            } else if is_popup {
-                (height * 0.24).clamp(26.0, 68.0)
-            } else if compact_card {
-                if font_size >= 35.2 { height * 0.267 } else { 24.0 }
-            } else {
-                (height * 0.36).max(68.0)
-            };
-            ui.add_space(lead_space);
+    // Thin translucent auto-hiding rounded scrollbar matching Spotify Desktop & Spicy `Simplebar.css`.
+    let scroll_inset_right = if compact_card { 5.0 } else { 8.0 };
+    let scroll_out = ui
+        .scope(|ui| {
+            let sc = &mut ui.spacing_mut().scroll;
+            sc.floating = true;
+            sc.bar_width = if compact_card { 4.0 } else { 5.5 };
+            sc.floating_width = sc.bar_width;
+            sc.bar_outer_margin = scroll_inset_right;
+            sc.bar_inner_margin = 3.0;
+            sc.foreground_color = false;
+            sc.dormant_background_opacity = 0.0;
+            sc.active_background_opacity = 0.0;
+            sc.interact_background_opacity = 0.0;
+            sc.dormant_handle_opacity = 0.0;
+            sc.active_handle_opacity = 0.50;
+            sc.interact_handle_opacity = 0.80;
+            let vis = ui.visuals_mut();
+            vis.widgets.inactive.bg_fill = Color32::from_white_alpha(140);
+            vis.widgets.hovered.bg_fill = Color32::from_white_alpha(190);
+            vis.widgets.active.bg_fill = Color32::from_white_alpha(230);
 
-            let line_w = (total_width - left_margin.max(0.0) * 2.0)
-                .clamp(120.0, 760.0);
-            let centered_left = ((total_width - line_w) * 0.5).max(0.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                if centered_left > 0.0 {
-                    ui.add_space(centered_left);
-                }
-                ui.vertical(|ui| {
-                    ui.set_width(line_w);
-                    // Comfortable Spotify/Spicy Lyrics vertical rhythm (`~0.68em` main gap, tight `0.18em` for background ad-libs).
-                    let row_gap = if is_popup {
-                        (font_size * 0.54).clamp(12.0, 20.0)
-                    } else if compact_card {
-                        (font_size * 0.62).clamp(15.5, 22.0)
-                    } else {
-                        (font_size * 0.68).clamp(18.0, 30.0)
-                    };
-                    let (pad_h, fade_h) = if is_popup {
-                        (6.0, (height * 0.14).clamp(26.0, 44.0))
-                    } else if compact_card {
-                        (6.0, (height * 0.14).clamp(32.0, 48.0))
-                    } else {
-                        // Generous soft vertical vignette matching Spotify Desktop (~16% top/bottom fade).
-                        (8.0, (height * 0.16).clamp(68.0, 118.0))
-                    };
-                    if lyrics.synced {
-                        if let Some(first_ms) = first_vocal_ms {
-                            if eff_pos < first_ms
-                                && should_render_synthetic_intro_dots(&lyrics.lines, first_ms)
-                            {
-                                let dots_r = paint_interlude_dots(
-                                    ui,
-                                    font_size,
-                                    eff_pos,
-                                    0,
-                                    first_ms,
-                                    true,
-                                    motion_on,
-                                    fade_rect,
-                                    fade_h,
-                                );
-                                active_rect_seen = Some(dots_r);
-                                active_content_center_y = Some(dots_r.center().y - content_origin_y);
-                                ui.add_space(if compact_card { 8.0 } else { 14.0 });
-                            }
-                        }
+            let mut scroll_area = egui::ScrollArea::vertical()
+                .id_salt((salt, track_id))
+                .max_height(height)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                .auto_shrink([false, false])
+                .animated(false);
+            if let Some(y) = applied_scroll_y {
+                scroll_area = scroll_area.vertical_scroll_offset(y);
+            }
+            scroll_area.show(ui, |ui| {
+                let content_origin_y = ui.cursor().top();
+                let lead_space = if !lyrics.synced {
+                    if compact_card { 12.0 } else { 64.0 }
+                } else if is_popup {
+                    (height * 0.24).clamp(26.0, 68.0)
+                } else if compact_card {
+                    if font_size >= 35.2 { height * 0.267 } else { 20.0 }
+                } else {
+                    (height * 0.36).max(68.0)
+                };
+                ui.add_space(lead_space);
+
+                let line_w = (total_width - left_margin.max(0.0) * 2.0)
+                    .clamp(120.0, 760.0);
+                let centered_left = ((total_width - line_w) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if centered_left > 0.0 {
+                        ui.add_space(centered_left);
                     }
-
-                    let has_duet = lyrics.lines.iter().any(|l| !l.right_align)
-                        && lyrics.lines.iter().any(|l| l.right_align);
-                    let wrap_w = if has_duet && line_w >= 380.0 {
-                        (line_w * 0.84).max(260.0)
-                    } else {
-                        line_w
-                    };
-                    // Reserve two painter slots strictly behind all lyric lines for the single morphing hover pill.
-                    let pill_fill_slot = ui.painter().add(egui::Shape::Noop);
-                    let pill_stroke_slot = ui.painter().add(egui::Shape::Noop);
-                    let mut hovered_content_rect: Option<Rect> = None;
-
-                    for (index, line) in lyrics.lines.iter().enumerate() {
-                        // Detect if a mid-song instrumental interlude gap (>= 3.5s) follows this main line,
-                        // suppressing synthetic dots whenever an explicit instrumental line already covers the break.
-                        let interlude_gap = synthetic_mid_interlude_gap(&lyrics.lines, index);
-                        let in_following_gap = interlude_gap
-                            .is_some_and(|(gs, ge)| eff_pos >= gs && eff_pos < ge);
-                        let is_focus = active == Some(index) && !in_following_gap;
-                        let is_singing = is_focus
-                            || (line.background && lyrics.is_line_singing(index, eff_pos));
-                        let next_is_bg = lyrics.lines.get(index + 1).is_some_and(|n| n.background);
-                        let line_right = has_duet && line.right_align;
-                        let line_font_sz = if line.background {
-                            (font_size * 0.72).clamp(13.0, 24.0)
+                    ui.vertical(|ui| {
+                        ui.set_width(line_w);
+                        let col_left = ui.cursor().left();
+                        // Comfortable Spotify/Spicy Lyrics vertical rhythm (`~0.68em` main gap, tight `0.18em` for background ad-libs).
+                        let row_gap = if is_popup {
+                            (font_size * 0.54).clamp(12.0, 20.0)
+                        } else if compact_card {
+                            (font_size * 0.60).clamp(14.5, 22.0)
                         } else {
-                            font_size
+                            (font_size * 0.68).clamp(18.0, 30.0)
                         };
-                        let line_id = ui.scope_id().with(salt).with(("line-hov", index));
-                        let prev_hovered = ui.ctx().data(|d| d.get_temp::<bool>(line_id)).unwrap_or(false);
-                        let hover_t = if !prev_hovered && !motion_on {
-                            0.0
-                        } else if motion_on {
-                            ui.ctx().animate_bool_with_time(line_id.with("t"), prev_hovered, 0.18)
+                        let (pad_h, fade_h) = if is_popup {
+                            (6.0, (height * 0.14).clamp(26.0, 44.0))
+                        } else if compact_card {
+                            (6.0, (height * 0.14).clamp(30.0, 48.0))
                         } else {
-                            1.0
+                            // Generous soft vertical vignette matching Spotify Desktop (~16% top/bottom fade).
+                            (8.0, (height * 0.16).clamp(68.0, 118.0))
                         };
-                        let dist = active.map(|cur| index.abs_diff(cur)).unwrap_or(0);
-                        let (mut color, lift_px, scale, mut blur_px) = line_style(
-                            ui,
-                            salt,
-                            index,
-                            lyrics.synced,
-                            is_line_only,
-                            if is_singing { Some(index) } else if in_following_gap { None } else { active },
-                            hide_blur,
-                            motion_on,
-                            dist,
-                        );
-                        if in_following_gap {
-                            color = PAST_SUNG_WHITE;
-                            blur_px = if hide_blur { 0.0 } else { 1.1 };
-                        }
-                        if line.background && !is_singing {
-                            color = Color32::from_white_alpha((color.a() as f32 * 0.82).round() as u8);
-                            blur_px *= 0.85;
-                        }
-                        let eff_blur = blur_px * (1.0 - hover_t);
-                        let eff_alpha = egui::lerp(color.a() as f32..=255.0, hover_t).round() as u8;
-                        let eff_color = Color32::from_white_alpha(eff_alpha);
-                        let word_pos = is_singing.then_some(eff_pos);
-                        let line_end_ms = lyrics.lines.get(index + 1).and_then(|n| n.time_ms);
 
-                        if lyrics.synced && is_instrumental_line(&line.text) && line.time_ms.is_some() {
-                            // Collapse consecutive instrumental/blank lines into a single `• • •` interlude.
-                            if let Some((start_ms, end_ms, run_end_idx)) =
-                                explicit_instrumental_span(&lyrics.lines, index)
-                            {
-                                let run_active = active
-                                    .is_some_and(|cur| cur >= index && cur <= run_end_idx);
-                                let dots_r = paint_interlude_dots(
-                                    ui,
-                                    font_size,
-                                    eff_pos,
-                                    start_ms,
-                                    end_ms,
-                                    run_active,
-                                    motion_on,
-                                    fade_rect,
-                                    fade_h,
-                                );
-                                if run_active {
-                                    active_rect_seen = Some(dots_r);
-                                    active_content_center_y = Some(dots_r.center().y - content_origin_y);
+                        let has_duet = lyrics.lines.iter().any(|l| !l.right_align)
+                            && lyrics.lines.iter().any(|l| l.right_align);
+                        let wrap_w = if has_duet && line_w >= 380.0 {
+                            (line_w * 0.84).max(260.0)
+                        } else {
+                            line_w
+                        };
+                        // Reserve two painter slots strictly behind all lyric lines for the single morphing hover pill.
+                        let pill_fill_slot = ui.painter().add(egui::Shape::Noop);
+                        let mut hovered_content_rect: Option<Rect> = None;
+
+                        // Read previous frame's browse/hover focus so scrolling & hovering smoothly focus
+                        // the line under the pointer or viewport center just like Spotify + Spicy Lyrics!
+                        let browse_focus_id = ui.scope_id().with((salt, track_id, "browse-focus"));
+                        let (prev_hovered_line, prev_center_line) = ui
+                            .ctx()
+                            .data(|d| d.get_temp::<(Option<usize>, Option<usize>)>(browse_focus_id))
+                            .unwrap_or((None, None));
+                        let prev_hovered_line = force_hover_line.or(prev_hovered_line);
+                        let visual_focus_anchor = if manual_paused {
+                            prev_hovered_line.or(prev_center_line).or(active_vocal)
+                        } else {
+                            active_vocal
+                        };
+                        let viewport_focus_y = fade_rect.top() + height * 0.44;
+                        let mut next_hovered_line: Option<usize> = None;
+                        let mut best_center_line: Option<(f32, usize)> = None;
+
+                        for (ev_idx, event) in timeline.iter().enumerate() {
+                            match *event {
+                                crate::lrc::LyricsEvent::Interlude(inter) => {
+                                    let is_active_interlude =
+                                        active_interlude.is_some_and(|(ai, _)| ai == ev_idx);
+                                    let frame = compute_refreshed_dots_frame(
+                                        eff_pos,
+                                        inter.start_ms,
+                                        inter.end_ms,
+                                        is_active_interlude,
+                                    );
+                                    if frame.layout_open > 0.005 || is_active_interlude {
+                                        let (dots_r, dots_seek) = paint_refreshed_interlude_dots(
+                                            ui,
+                                            font_size,
+                                            inter,
+                                            frame,
+                                            fade_rect,
+                                            pad_h,
+                                            fade_h,
+                                        );
+                                        if let Some(ms) = dots_seek {
+                                            seek_target = Some(ms);
+                                            follow.pending_seek = None;
+                                            follow.manual_scroll_at = None;
+                                            follow.last_active = None;
+                                            follow.last_active_event = None;
+                                            follow.anim_target_y = None;
+                                            ui.ctx().request_repaint();
+                                        }
+                                        if is_active_interlude {
+                                            active_rect_seen = Some(dots_r);
+                                            active_content_center_y =
+                                                Some(dots_r.center().y - content_origin_y);
+                                            if playing && motion_on {
+                                                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                                            }
+                                        }
+                                        ui.add_space(row_gap * 0.65 * frame.layout_open);
+                                    }
                                 }
-                                ui.add_space(row_gap);
+                                crate::lrc::LyricsEvent::VocalLine(index) => {
+                                    let line = &lyrics.lines[index];
+                                    let is_focus = active_vocal == Some(index);
+                                    let is_singing = is_focus
+                                        || (line.background
+                                            && active_interlude.is_none()
+                                            && lyrics.is_line_singing(index, eff_pos));
+                                    let next_is_bg = lyrics
+                                        .lines
+                                        .get(index + 1)
+                                        .is_some_and(|n| n.background);
+                                    let line_right = has_duet && line.right_align;
+                                    let line_font_sz = if line.background {
+                                        (font_size * 0.72).clamp(13.0, 24.0)
+                                    } else {
+                                        font_size
+                                    };
+
+                                    let is_hovered = prev_hovered_line == Some(index);
+                                    let is_browse_center = manual_paused
+                                        && !is_singing
+                                        && !is_hovered
+                                        && visual_focus_anchor == Some(index);
+                                    let dist = visual_focus_anchor
+                                        .map(|cur| index.abs_diff(cur))
+                                        .unwrap_or(1);
+                                    let target_visual = compute_lyric_visual_state(
+                                        lyrics.synced,
+                                        is_line_only,
+                                        visual_focus_anchor,
+                                        index,
+                                        dist,
+                                        line.background,
+                                        is_singing,
+                                        active_interlude.is_some() && !manual_paused,
+                                        is_hovered,
+                                        is_browse_center,
+                                    );
+                                    let visual = line_style(
+                                        ui,
+                                        salt,
+                                        index,
+                                        target_visual,
+                                        motion_on,
+                                    );
+
+                                    let eff_color = Color32::from_white_alpha(
+                                        (visual.opacity * 255.0).round().clamp(0.0, 255.0) as u8,
+                                    );
+                                    let word_pos = is_singing.then_some(eff_pos);
+                                    let line_end_ms = lyrics
+                                        .lines
+                                        .get(index + 1)
+                                        .and_then(|n| n.time_ms);
+
+                                    let (resp, text_rect, seek) = line_widget(
+                                        ui,
+                                        line,
+                                        line_font_sz,
+                                        wrap_w,
+                                        eff_color,
+                                        word_pos,
+                                        line_end_ms,
+                                        motion_on,
+                                        visual.lift_px,
+                                        visual.scale,
+                                        visual.blur_sigma_pt,
+                                        visual.glow_strength,
+                                        fade_rect,
+                                        pad_h,
+                                        fade_h,
+                                        line_right,
+                                    );
+                                    if resp.rect.intersects(fade_rect) {
+                                        let center_dist = (resp.rect.center().y - viewport_focus_y).abs();
+                                        if best_center_line.is_none_or(|(best_d, _)| center_dist < best_d) {
+                                            best_center_line = Some((center_dist, index));
+                                        }
+                                    }
+                                    let line_hovered =
+                                        resp.hovered() || force_hover_line == Some(index);
+                                    if line_hovered && line.time_ms.is_some() {
+                                        next_hovered_line = Some(index);
+                                        // Sleek translucent rounded hover pill hugging the rendered text bounds
+                                        // with generous breathing room inside compact cards (never touching card edges or scrollbar).
+                                        let pad_x = if compact_card { 8.0 } else { 14.0 };
+                                        let pad_top = if compact_card { 6.0 } else { 8.0 };
+                                        let pad_bot = if compact_card { 5.0 } else { 6.0 };
+                                        let shifted = text_rect
+                                            .translate(Vec2::new(0.0, visual.lift_px - content_origin_y));
+                                        let min_pill_x = if compact_card {
+                                            (col_left - pad_x).max(fade_rect.left() + 10.0)
+                                        } else {
+                                            col_left - pad_x
+                                        };
+                                        let max_pill_x = if compact_card {
+                                            (col_left + line_w + pad_x).min(fade_rect.right() - 14.0)
+                                        } else {
+                                            col_left + line_w + pad_x
+                                        };
+                                        let pill = Rect::from_min_max(
+                                            Pos2::new((shifted.min.x - pad_x).max(min_pill_x), shifted.min.y - pad_top),
+                                            Pos2::new((shifted.max.x + pad_x).min(max_pill_x), shifted.max.y + pad_bot),
+                                        );
+                                        hovered_content_rect = Some(pill);
+                                    }
+                                    if is_focus {
+                                        active_rect_seen = Some(resp.rect);
+                                        active_content_center_y =
+                                            Some(resp.rect.center().y - content_origin_y);
+                                    }
+                                    if let Some(ms) = seek {
+                                        seek_target = Some(ms);
+                                        follow.pending_seek = Some(PendingLyricSeek {
+                                            line_index: index,
+                                            target_ms: ms,
+                                            origin_pos_ms: position,
+                                            clicked_at: now,
+                                        });
+                                        follow.manual_scroll_at = None;
+                                        follow.last_active = None;
+                                        follow.last_active_event = None;
+                                        follow.anim_target_y = None;
+                                        ui.ctx().request_repaint();
+                                    }
+                                    let gap_after = if next_is_bg {
+                                        (row_gap * 0.24).clamp(4.0, 8.0)
+                                    } else {
+                                        row_gap
+                                    };
+                                    ui.add_space(gap_after);
+                                }
                             }
-                            continue;
                         }
 
-                        let (resp, text_rect, seek) = line_widget(
-                            ui,
-                            line,
-                            line_font_sz,
-                            wrap_w,
-                            eff_color,
-                            word_pos,
-                            line_end_ms,
-                            motion_on,
-                            lift_px,
-                            scale,
-                            eff_blur,
-                            fade_rect,
-                            pad_h,
-                            fade_h,
-                            line_right,
-                        );
-                        let now_hovered = resp.hovered();
-                        if now_hovered != prev_hovered {
-                            ui.ctx().data_mut(|d| d.insert_temp(line_id, now_hovered));
+                        let next_center_line = best_center_line.map(|(_, idx)| idx);
+                        if (next_hovered_line, next_center_line) != (prev_hovered_line, prev_center_line) {
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(browse_focus_id, (next_hovered_line, next_center_line));
+                            });
                             ui.ctx().request_repaint();
                         }
-                        if now_hovered && line.time_ms.is_some() {
-                            // Optically center Vietnamese ascenders/descenders inside the rounded hover pill.
-                            let shifted = text_rect.translate(Vec2::new(0.0, lift_px - content_origin_y));
-                            let pill = Rect::from_min_max(
-                                Pos2::new(shifted.min.x - 16.0, shifted.min.y - 10.0),
-                                Pos2::new(shifted.max.x + 16.0, shifted.max.y + 6.0),
-                            );
-                            hovered_content_rect = Some(pill);
-                        }
-                        if is_focus {
-                            active_rect_seen = Some(resp.rect);
-                            active_content_center_y = Some(resp.rect.center().y - content_origin_y);
-                        }
-                        if let Some(ms) = seek {
-                            seek_target = Some(ms);
-                            follow.manual_scroll_at = None;
-                            follow.last_active = None;
-                            follow.anim_target_y = None;
-                        }
-                        let gap_after = if next_is_bg {
-                            (row_gap * 0.24).clamp(4.0, 8.0)
-                        } else {
-                            row_gap
-                        };
-                        ui.add_space(gap_after);
 
-                        // Smoothly expand animated 3-dot interlude (`• • •`) during mid-song instrumental solos (>= 3.5s).
-                        if let Some((gs, ge)) = interlude_gap {
-                            let gap_anim_id = ui.scope_id().with(salt).with(("mid-gap", index));
-                            let gap_t = if motion_on {
-                                ui.ctx().animate_bool_with_time(gap_anim_id, in_following_gap, 0.32)
-                            } else if in_following_gap {
-                                1.0
-                            } else {
-                                0.0
-                            };
-                            if gap_t > 0.02 {
-                                let dots_r = paint_interlude_dots(
-                                    ui,
-                                    font_size * (0.65 + 0.35 * gap_t),
-                                    eff_pos,
-                                    gs,
-                                    ge,
-                                    in_following_gap,
-                                    motion_on,
-                                    fade_rect,
-                                    fade_h,
-                                );
-                                if in_following_gap {
-                                    active_rect_seen = Some(dots_r);
-                                    active_content_center_y = Some(dots_r.center().y - content_origin_y);
+                        // Smoothly glide & morph the single shared translucent hover pill behind lyric lines.
+                        let pill_id = ui.scope_id().with(salt).with("hover-pill");
+                        let mut pill_state = ui
+                            .ctx()
+                            .data(|d| d.get_temp::<LyricsHoverPillState>(pill_id))
+                            .filter(|s| s.track == track_id)
+                            .unwrap_or(LyricsHoverPillState {
+                                track: track_id,
+                                ..Default::default()
+                            });
+                        if pill_state.step(hovered_content_rect, dt, motion_on) {
+                            ui.ctx().request_repaint();
+                        }
+                        if let Some(content_pill) = pill_state.rect {
+                            if pill_state.opacity > 0.01 {
+                                let screen_pill =
+                                    content_pill.translate(Vec2::new(0.0, content_origin_y));
+                                let cy = screen_pill.center().y;
+                                let edge_fade = if fade_h <= 0.5 {
+                                    1.0
+                                } else {
+                                    (smoothstep(pad_h, pad_h + fade_h, cy - fade_rect.top())
+                                        * smoothstep(
+                                            pad_h,
+                                            pad_h + fade_h,
+                                            fade_rect.bottom() - cy,
+                                        ))
+                                    .clamp(0.0, 1.0)
+                                };
+                                let a = (pill_state.opacity * edge_fade).clamp(0.0, 1.0);
+                                if a > 0.01 && screen_pill.intersects(fade_rect.expand(12.0)) {
+                                    let radius = CornerRadius::same(if compact_card { 12 } else { 14 });
+                                    ui.painter().set(
+                                        pill_fill_slot,
+                                        egui::Shape::rect_filled(
+                                            screen_pill,
+                                            radius,
+                                            Color32::from_white_alpha((24.0 * a).round() as u8),
+                                        ),
+                                    );
                                 }
-                                ui.add_space(row_gap * 0.55 * gap_t);
                             }
                         }
-                    }
+                        ui.ctx().data_mut(|d| d.insert_temp(pill_id, pill_state));
 
-                    // Smoothly glide & morph the single shared Spotify frosted hover pill between lyric lines!
-                    let pill_id = ui.scope_id().with(salt).with("hover-pill");
-                    let mut pill_state = ui
-                        .ctx()
-                        .data(|d| d.get_temp::<LyricsHoverPillState>(pill_id))
-                        .filter(|s| s.track == track_id)
-                        .unwrap_or(LyricsHoverPillState {
-                            track: track_id,
-                            ..Default::default()
-                        });
-                    if pill_state.step(hovered_content_rect, dt, motion_on) {
-                        ui.ctx().request_repaint();
-                    }
-                    if let Some(content_pill) = pill_state.rect {
-                        if pill_state.opacity > 0.01 {
-                            let screen_pill = content_pill.translate(Vec2::new(0.0, content_origin_y));
-                            let cy = screen_pill.center().y;
-                            let edge_fade = if fade_h <= 0.5 {
-                                1.0
-                            } else {
-                                (smoothstep(pad_h, pad_h + fade_h, cy - fade_rect.top())
-                                    * smoothstep(pad_h, pad_h + fade_h, fade_rect.bottom() - cy))
-                                .clamp(0.0, 1.0)
-                            };
-                            let a = (pill_state.opacity * edge_fade).clamp(0.0, 1.0);
-                            if a > 0.01 && screen_pill.intersects(fade_rect.expand(12.0)) {
-                                let radius = CornerRadius::same(12);
-                                ui.painter().set(
-                                    pill_fill_slot,
-                                    egui::Shape::rect_filled(
-                                        screen_pill,
-                                        radius,
-                                        Color32::from_white_alpha((34.0 * a).round() as u8),
-                                    ),
+                        if let Some((writer, provider)) = credits {
+                            // Spicy Lyrics `Exp_RefinedCredits` (`.SongCredits`, Mixed.css:1145-1209):
+                            // dimmed 0.55 until the last lyric line is active or finished (`LinesAllSung`).
+                            let last_active = !lyrics.lines.is_empty()
+                                && active_vocal == Some(lyrics.lines.len() - 1);
+                            let all_sung = !lyrics.synced || last_active || lyrics.ended(eff_pos);
+                            let dim: f32 = if all_sung { 1.0 } else { 0.55 };
+                            let credit_sz = (font_size * 0.52).clamp(13.0, 16.0).round();
+                            let prov_sz = (credit_sz * 0.90).clamp(12.0, 14.0).round();
+                            ui.add_space((font_size * 0.16).clamp(3.0, 6.0));
+
+                            if !writer.is_empty() {
+                                let mut w_job = egui::text::LayoutJob::default();
+                                w_job.wrap.max_width = line_w;
+                                w_job.append(
+                                    "Written by ",
+                                    0.0,
+                                    TextFormat {
+                                        font_id: semi(credit_sz),
+                                        color: Color32::from_white_alpha(
+                                            (168.0 * dim).round() as u8,
+                                        ),
+                                        ..Default::default()
+                                    },
                                 );
-                                ui.painter().set(
-                                    pill_stroke_slot,
-                                    egui::Shape::rect_stroke(
-                                        screen_pill,
-                                        radius,
-                                        Stroke::new(1.0, Color32::from_white_alpha((14.0 * a).round() as u8)),
-                                        egui::StrokeKind::Inside,
-                                    ),
+                                w_job.append(
+                                    writer,
+                                    0.0,
+                                    TextFormat {
+                                        font_id: bold(credit_sz),
+                                        color: Color32::from_white_alpha(
+                                            (224.0 * dim).round() as u8,
+                                        ),
+                                        ..Default::default()
+                                    },
                                 );
+                                let w_galley = ui.fonts_mut(|f| f.layout_job(w_job));
+                                let (w_rect, _) =
+                                    ui.allocate_exact_size(w_galley.size(), egui::Sense::hover());
+                                if w_rect.intersects(fade_rect) {
+                                    let masked_w = mask_galley_vertical(
+                                        &w_galley,
+                                        w_rect.min,
+                                        fade_rect,
+                                        pad_h,
+                                        fade_h,
+                                        None,
+                                    );
+                                    ui.painter().galley(w_rect.min, masked_w, Color32::WHITE);
+                                }
+                                ui.add_space(3.5);
                             }
-                        }
-                    }
-                    ui.ctx().data_mut(|d| d.insert_temp(pill_id, pill_state));
 
-                    if let Some((writer, provider)) = credits {
-                        // Spicy Lyrics `Exp_RefinedCredits` (`.SongCredits`, Mixed.css:1145-1209):
-                        // dimmed 0.55 until the last lyric line is active or finished (`LinesAllSung`).
-                        let last_active =
-                            !lyrics.lines.is_empty() && active == Some(lyrics.lines.len() - 1);
-                        let all_sung =
-                            !lyrics.synced || hide_blur || last_active || lyrics.ended(eff_pos);
-                        let dim: f32 = if all_sung { 1.0 } else { 0.55 };
-                        let credit_sz = (font_size * 0.52).clamp(12.6, 15.5);
-                        let prov_sz = (credit_sz * 0.90).clamp(11.6, 13.8);
-                        ui.add_space((font_size * 0.16).clamp(3.0, 6.0));
+                            let prov_text = format!("Provided by {provider}");
+                            let p_galley = ui.painter().layout(
+                                prov_text,
+                                semi(prov_sz),
+                                Color32::from_white_alpha((142.0 * dim).round() as u8),
+                                line_w,
+                            );
+                            let (p_rect, _) =
+                                ui.allocate_exact_size(p_galley.size(), egui::Sense::hover());
+                            if p_rect.intersects(fade_rect) {
+                                let masked_p = mask_galley_vertical(
+                                    &p_galley,
+                                    p_rect.min,
+                                    fade_rect,
+                                    pad_h,
+                                    fade_h,
+                                    None,
+                                );
+                                ui.painter().galley(p_rect.min, masked_p, Color32::WHITE);
+                            }
 
-                        let mut w_job = egui::text::LayoutJob::default();
-                        w_job.wrap.max_width = line_w;
-                        w_job.append(
-                            "Written by ",
-                            0.0,
-                            TextFormat {
-                                font_id: semi(credit_sz),
-                                color: Color32::from_white_alpha((168.0 * dim).round() as u8),
-                                ..Default::default()
-                            },
-                        );
-                        w_job.append(
-                            writer,
-                            0.0,
-                            TextFormat {
-                                font_id: bold(credit_sz),
-                                color: Color32::from_white_alpha((224.0 * dim).round() as u8),
-                                ..Default::default()
-                            },
-                        );
-                        let w_galley = ui.fonts_mut(|f| f.layout_job(w_job));
-                        let (w_rect, _) = ui.allocate_exact_size(w_galley.size(), egui::Sense::hover());
-                        if w_rect.intersects(fade_rect) {
-                            let masked_w = mask_galley_vertical(&w_galley, w_rect.min, fade_rect, pad_h, fade_h, None);
-                            ui.painter().galley(w_rect.min, masked_w, Color32::WHITE);
+                            // Spicy Lyrics API ToS Section 6: display Uploader & Maker attribution ONLY for `source == "spicy_lyrics"`.
+                            if lyrics.source.as_deref() == Some("spicy_lyrics") {
+                                if let Some(ref attr) = lyrics.attribution {
+                                    ui.add_space(3.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        let link_col = Color32::from_white_alpha(
+                                            (188.0 * dim).round() as u8,
+                                        );
+                                        let muted_col = Color32::from_white_alpha(
+                                            (132.0 * dim).round() as u8,
+                                        );
+                                        let attr_sz = (prov_sz * 0.94).round();
+                                        ui.label(
+                                            RichText::new("Uploaded by")
+                                                .font(semi(attr_sz))
+                                                .color(muted_col),
+                                        );
+                                        let up_label = format!("@{}", attr.uploader.username);
+                                        let up_resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(up_label)
+                                                        .font(bold(attr_sz))
+                                                        .color(link_col),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if up_resp.clicked() && !attr.uploader.url.is_empty() {
+                                            ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                                &attr.uploader.url,
+                                            ));
+                                        }
+                                        if let Some(ref maker) = attr.maker {
+                                            ui.label(
+                                                RichText::new("· Made by")
+                                                    .font(semi(attr_sz))
+                                                    .color(muted_col),
+                                            );
+                                            let mk_label = format!("@{}", maker.username);
+                                            let mk_resp = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        RichText::new(mk_label)
+                                                            .font(bold(attr_sz))
+                                                            .color(link_col),
+                                                    )
+                                                    .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                            if mk_resp.clicked() && !maker.url.is_empty() {
+                                                ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                                    &maker.url,
+                                                ));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        } else if active_vocal.is_none()
+                            && active_interlude.is_none()
+                            && lyrics.ended(position)
+                        {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(ended_label)
+                                    .font(semi((font_size * 0.65).round()))
+                                    .color(PAST_SUNG_WHITE),
+                            );
                         }
-
-                        ui.add_space(3.5);
-                        let prov_text = format!("Provided by {provider}");
-                        let p_galley = ui.painter().layout(
-                            prov_text,
-                            semi(prov_sz),
-                            Color32::from_white_alpha((142.0 * dim).round() as u8),
-                            line_w,
-                        );
-                        let (p_rect, _) = ui.allocate_exact_size(p_galley.size(), egui::Sense::hover());
-                        if p_rect.intersects(fade_rect) {
-                            let masked_p = mask_galley_vertical(&p_galley, p_rect.min, fade_rect, pad_h, fade_h, None);
-                            ui.painter().galley(p_rect.min, masked_p, Color32::WHITE);
-                        }
-                    } else if active.is_none() && lyrics.ended(position) {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(ended_label).font(semi(font_size * 0.65)).color(PAST_SUNG_WHITE));
-                    }
+                    });
                 });
-            });
 
-            let trail_space = if is_popup { 52.0 } else { lead_space };
-            ui.add_space(trail_space);
-        });
+                let trail_space = if is_popup { 52.0 } else { lead_space };
+                ui.add_space(trail_space);
+            })
+        })
+        .inner;
 
     let clip_rect = scroll_out.inner_rect;
     let cur_scroll_y = scroll_out.state.clamped_offset().y;
@@ -2404,12 +2673,21 @@ fn render_lyrics_scroll_body(
             cy >= clip_rect.top() + height * 0.10 && cy <= clip_rect.bottom() - height * 0.10
         });
     let active_in_reading_band = !force_manual_offscreen
-        && active_rect_seen.is_some_and(|r| (r.center().y - (clip_rect.top() + anchor_y)).abs() <= height * 0.20);
+        && active_rect_seen.is_some_and(|r| {
+            (r.center().y - (clip_rect.top() + anchor_y)).abs() <= height * 0.20
+        });
 
     if let Some(content_cy) = active_content_center_y {
         let desired_y = (content_cy - anchor_y).clamp(0.0, max_scroll_y);
-        if !manual_paused_now && lyrics.synced && (wants_recenter || (desired_y - cur_scroll_y).abs() > height * 0.18) {
-            if follow.anim_target_y.is_none_or(|t| (t - desired_y).abs() > 1.5) {
+        if !manual_paused_now
+            && lyrics.synced
+            && (wants_recenter || (desired_y - cur_scroll_y).abs() > height * 0.18)
+            && (desired_y - cur_scroll_y).abs() > 1.0
+        {
+            if follow
+                .anim_target_y
+                .is_none_or(|t| (t - desired_y).abs() > 1.5)
+            {
                 follow.anim_target_y = Some(desired_y);
                 ui.ctx().request_repaint();
             }
@@ -2432,8 +2710,8 @@ fn render_lyrics_scroll_body(
         }
     }
 
-    // Floating `.ScrollToActive` pure frosted glass circle (NO muddy dark drop shadow — crisp translucent ring matching Spotify).
-    if lyrics.synced && manual_paused_now && !active_in_view && active.is_some() {
+    // Floating `.ScrollToActive` frosted glass return-to-current control.
+    if lyrics.synced && manual_paused_now && !active_in_view && has_active_target {
         let _ = sync_label;
         let (btn_d, inset_r, inset_b, icon_d) = if compact_card {
             (32.0, 24.0, 24.0, 12.0)
@@ -2504,64 +2782,156 @@ fn render_lyrics_scroll_body(
     seek_target
 }
 
+/// Computes the visual state for a lyric line matching Spotify + Spicy Lyrics (`Mixed.css:439-447`, `1437-1510`):
+/// - The currently singing line (`is_singing`) always renders sharp with syllable sweep & active glow.
+/// - Hovering an inactive line (`is_hovered`) sharpens it (`blur = 0`) and lifts readability inside the hover pill
+///   without triggering active singing glow or altering playback focus.
+/// - When manually scrolled away, `focus_anchor` tracks the hovered line or viewport center (`is_browse_center`)
+///   so scrolled lyrics stay cleanly focused and readable instead of blurring the whole screen into unreadable soup.
+#[allow(clippy::too_many_arguments)]
+fn compute_lyric_visual_state(
+    synced: bool,
+    is_line_only: bool,
+    focus_anchor: Option<usize>,
+    index: usize,
+    dist: usize,
+    background: bool,
+    is_singing: bool,
+    in_interlude: bool,
+    is_hovered: bool,
+    is_browse_center: bool,
+) -> LyricVisualState {
+    if !synced {
+        return LyricVisualState {
+            is_active: false,
+            opacity: 0.88,
+            blur_sigma_pt: 0.0,
+            glow_strength: 0.0,
+            scale: 1.0,
+            lift_px: 0.0,
+        };
+    }
+
+    if is_singing {
+        return LyricVisualState {
+            is_active: true,
+            opacity: 1.0,
+            blur_sigma_pt: 0.0,
+            glow_strength: 1.0,
+            scale: if is_line_only { 1.02 } else { 1.0 },
+            lift_px: -1.2,
+        };
+    }
+
+    // Hovered inactive line: razor-sharp (`blur = 0`) with a soft white outline glow halo
+    // matching Spotify + Spicy Lyrics hover focus while staying softer than the 1.0 singing line.
+    if is_hovered {
+        return LyricVisualState {
+            is_active: false,
+            opacity: if background { 0.54 } else { 0.66 },
+            blur_sigma_pt: 0.0,
+            glow_strength: 0.62,
+            scale: 1.0,
+            lift_px: 0.0,
+        };
+    }
+
+    // Manual-scroll viewport focal line (when pointer isn't hovering another line):
+    // crisp text + subtle outline glow so scrolled lyrics stay cleanly focused and readable.
+    if is_browse_center {
+        return LyricVisualState {
+            is_active: false,
+            opacity: if background { 0.44 } else { 0.54 },
+            blur_sigma_pt: 0.0,
+            glow_strength: 0.36,
+            scale: 0.995,
+            lift_px: 0.0,
+        };
+    }
+
+    // Optical depth-of-field falloff around `focus_anchor` (active singing line during auto-follow,
+    // or hovered/viewport-center line while manually browsing scrolled lyrics).
+    let (mut opacity, mut blur_sigma_pt) = if in_interlude || focus_anchor.is_none() {
+        (0.32_f32, 1.15_f32)
+    } else if focus_anchor == Some(index) {
+        (0.36_f32, 1.15_f32)
+    } else {
+        let op = match dist {
+            0 | 1 => 0.36,
+            2 => 0.29,
+            3 => 0.24,
+            4 => 0.20,
+            _ => 0.17,
+        };
+        let bl = match dist {
+            0 => 0.72,
+            1 => 1.35,
+            2 => 1.95,
+            3 => 2.55,
+            4 => 3.10,
+            _ => 3.60,
+        };
+        (op, bl)
+    };
+
+    if background {
+        opacity *= 0.86;
+        blur_sigma_pt *= 0.85;
+    }
+
+    LyricVisualState {
+        is_active: false,
+        opacity,
+        blur_sigma_pt,
+        glow_strength: 0.0,
+        scale: 0.98,
+        lift_px: 0.0,
+    }
+}
+
 fn line_style(
     ui: &Ui,
     salt: &str,
     index: usize,
-    synced: bool,
-    is_line_only: bool,
-    active: Option<usize>,
-    hide_blur: bool,
+    target: LyricVisualState,
     motion_on: bool,
-    dist: usize,
-) -> (Color32, f32, f32, f32) {
-    if !synced {
-        return (Color32::from_rgba_unmultiplied(255, 255, 255, 232), 0.0, 1.0, 0.0);
+) -> LyricVisualState {
+    if !motion_on {
+        return target;
     }
-
-    let is_active = active == Some(index);
-    let act_t = if motion_on {
-        ui.ctx().animate_bool_with_time(
-            ui.scope_id().with(salt).with(("line-act", index)),
-            is_active,
-            0.22,
-        )
-    } else if is_active {
-        1.0
-    } else {
-        0.0
-    };
-
-    let base_color = match active {
-        None => ACTIVE_UNSUNG_WHITE,
-        Some(cur) if index == cur => Color32::WHITE,
-        Some(_) => {
-            if hide_blur {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 136)
-            } else {
-                // `Mixed.css:232-270`: `.line.Sung` (`0.497 * 0.85 = 0.422`), `.line.NotSung` (`0.51`)
-                let a = match dist {
-                    0 | 1 => 118,
-                    2 => 104,
-                    3 => 88,
-                    _ => 72,
-                };
-                Color32::from_rgba_unmultiplied(255, 255, 255, a)
-            }
-        }
-    };
-
-    // `Animator/Shared.ts:5`: `BlurMultiplier = 1.25`
-    let blur_px = if !hide_blur && active.is_some() && !is_active {
-        (dist as f32 * 1.25).min(6.4)
-    } else {
-        0.0
-    };
-    let lift_px = if motion_on { -1.2 * act_t } else { 0.0 };
-    // `Mixed.css:706`: `.line.Active` scales up (`1.04` on Line-synced, `1.02` on Syllable-synced)
-    let scale_add = if is_line_only { 0.04 } else { 0.02 };
-    let scale = if motion_on { 1.0 + scale_add * act_t } else { 1.0 };
-    (base_color, lift_px, scale, blur_px)
+    let act_t = ui.ctx().animate_bool_with_time(
+        ui.scope_id().with(salt).with(("line-act", index)),
+        target.is_active,
+        0.26,
+    );
+    let opacity = ui.ctx().animate_value_with_time(
+        ui.scope_id().with(salt).with(("line-alpha", index)),
+        target.opacity,
+        0.28,
+    );
+    let blur_sigma_pt = ui.ctx().animate_value_with_time(
+        ui.scope_id().with(salt).with(("line-blur", index)),
+        target.blur_sigma_pt,
+        0.24,
+    );
+    let glow_strength = ui.ctx().animate_value_with_time(
+        ui.scope_id().with(salt).with(("line-glow", index)),
+        target.glow_strength,
+        0.22,
+    );
+    let scale = ui.ctx().animate_value_with_time(
+        ui.scope_id().with(salt).with(("line-scale", index)),
+        target.scale,
+        0.24,
+    );
+    LyricVisualState {
+        is_active: target.is_active,
+        opacity,
+        blur_sigma_pt,
+        glow_strength,
+        scale,
+        lift_px: target.lift_px * act_t,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2595,173 +2965,394 @@ fn spicy_y_offset_spline(t: f32) -> f32 {
     eval_spline(&[(0.0, 0.01), (0.90, -0.0167), (1.0, 0.0)], t)
 }
 
-fn is_instrumental_line(text: &str) -> bool {
-    let t = text.trim();
-    t.is_empty() || matches!(t, "♪" | "♫" | "♬" | "..." | "…" | "• • •")
-}
-
-/// Returns true if synthetic intro `• • •` dots should be inserted before `first_vocal_ms`,
-/// suppressing them whenever the lyrics already contain an explicit instrumental line beforehand.
-fn should_render_synthetic_intro_dots(lines: &[LyricLine], first_vocal_ms: u64) -> bool {
-    if first_vocal_ms < 2_500 {
-        return false;
+/// Exact port of Spicy Lyrics `src/utils/Lyrics/Animator/CubicBezier.ts` (`cubicBezier`).
+fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
     }
-    !lines
-        .iter()
-        .any(|l| is_instrumental_line(&l.text) && l.time_ms.is_some_and(|t| t < first_vocal_ms))
-}
-
-/// Returns a synthetic mid-song `(gap_start_ms, gap_end_ms)` interlude after `lines[index]`
-/// only when there is a >= 3.5s gap to the next main vocal line AND no explicit instrumental line
-/// already covers that break (preventing double `• • •` dots).
-fn synthetic_mid_interlude_gap(lines: &[LyricLine], index: usize) -> Option<(u64, u64)> {
-    let line = lines.get(index)?;
-    if line.background || is_instrumental_line(&line.text) {
-        return None;
+    if x >= 1.0 {
+        return 1.0;
     }
-    let end = line.end_ms?;
-    let mut next_main_idx = None;
-    for (offset, cand) in lines[index + 1..].iter().enumerate() {
-        let cand_idx = index + 1 + offset;
-        if is_instrumental_line(&cand.text) && cand.time_ms.is_some() {
-            // An explicit instrumental/blank timed line already handles this interlude.
-            return None;
+    let cx = 3.0 * x1;
+    let bx = 3.0 * (x2 - x1) - cx;
+    let ax = 1.0 - cx - bx;
+    let cy = 3.0 * y1;
+    let by = 3.0 * (y2 - y1) - cy;
+    let ay = 1.0 - cy - by;
+    let curve_x = |t: f32| ((ax * t + bx) * t + cx) * t;
+    let curve_y = |t: f32| ((ay * t + by) * t + cy) * t;
+    let slope_x = |t: f32| (3.0 * ax * t + 2.0 * bx) * t + cx;
+
+    let mut t = x;
+    for _ in 0..8 {
+        let error = curve_x(t) - x;
+        if error.abs() < 1e-6 {
+            return curve_y(t);
         }
-        if !cand.background {
-            next_main_idx = Some(cand_idx);
+        let slope = slope_x(t);
+        if slope.abs() < 1e-6 {
             break;
         }
+        t = (t - error / slope).clamp(0.0, 1.0);
     }
-    let next_start = lines.get(next_main_idx?)?.time_ms?;
-    (next_start >= end.saturating_add(3_500)).then_some((end, next_start))
-}
-
-/// Collapses a run of one or more consecutive explicit instrumental/blank timed lines into a single
-/// `(start_ms, end_ms, run_end_index)` span on the first line of the run (returning `None` for
-/// subsequent lines in the run or sub-2s empty LRC spacers).
-fn explicit_instrumental_span(lines: &[LyricLine], index: usize) -> Option<(u64, u64, usize)> {
-    let line = lines.get(index)?;
-    let start_ms = line.time_ms?;
-    if !is_instrumental_line(&line.text) {
-        return None;
-    }
-    // Suppress duplicate dots when the immediately preceding timed line was already instrumental.
-    if index > 0 {
-        let prev = &lines[index - 1];
-        if is_instrumental_line(&prev.text) && prev.time_ms.is_some() {
-            return None;
-        }
-    }
-    let mut run_end = index;
-    let mut explicit_symbol = !line.text.trim().is_empty();
-    while let Some(next) = lines.get(run_end + 1) {
-        if is_instrumental_line(&next.text) && next.time_ms.is_some() {
-            explicit_symbol |= !next.text.trim().is_empty();
-            run_end += 1;
+    let mut lo = 0.0_f32;
+    let mut hi = 1.0_f32;
+    t = x;
+    while hi - lo > 1e-6 {
+        if curve_x(t) < x {
+            lo = t;
         } else {
-            break;
+            hi = t;
         }
+        t = (lo + hi) * 0.5;
     }
-    let next_vocal_ms = lines.get(run_end + 1).and_then(|n| n.time_ms);
-    let end_ms = lines[run_end]
-        .end_ms
-        .or(next_vocal_ms)
-        .unwrap_or(start_ms + 4_000)
-        .max(start_ms + 500);
-    // Ignore tiny (< 2.2s) blank timestamped spacer lines that aren't real musical interludes.
-    if !explicit_symbol && end_ms.saturating_sub(start_ms) < 2_200 {
-        return None;
-    }
-    Some((start_ms, end_ms, run_end))
+    curve_y(t)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_interlude_dots(
-    ui: &mut Ui,
-    font_size: f32,
+// Verified constants from Spicy Lyrics `src/utils/Lyrics/Animator/Lyrics/LyricsAnimator.ts:121-156, 940-958`
+// and `src/utils/Lyrics/lyrics.ts:362` (commit `1c02f47cd64ed8c34bb76dd8ff00755db9d1d66f`).
+const REFRESHED_DOTS_DIM: f32 = 0.28;
+const REFRESHED_DOTS_LIT: f32 = 0.96;
+const REFRESHED_DOTS_ENTER_MS: f32 = 750.0;
+const REFRESHED_DOTS_ENTER_STAGGER_MS: f32 = 50.0;
+const REFRESHED_DOTS_BREATH_MS: f32 = 4000.0;
+const REFRESHED_DOTS_BREATH_SCALE: f32 = 0.2;
+const REFRESHED_DOTS_EXIT_GROW_MS: f32 = 750.0;
+const REFRESHED_DOTS_EXIT_SHRINK_MS: f32 = 250.0;
+const REFRESHED_DOTS_EXIT_SCALE: f32 = 0.5;
+const PRE_HIDDEN_DOT_LINE_MS: f32 = 500.0;
+
+fn spicy_dot_scale(fill: f32) -> f32 {
+    // `DotAnimations.ScaleRange` (`LyricsAnimator.ts:139-143`): waiting 0.72 -> peak 1.10 -> lit 1.00.
+    eval_spline(&[(0.0, 0.72), (0.68, 1.10), (1.0, 1.00)], fill)
+}
+
+fn spicy_dot_y_offset(fill: f32) -> f32 {
+    // `DotAnimations.YOffsetRange` (`LyricsAnimator.ts:144-149`): upward wave hop while activating, relative to font_size.
+    eval_spline(&[(0.0, 0.0), (0.55, -0.15), (1.0, -0.03)], fill)
+}
+
+fn spicy_dot_glow(fill: f32) -> f32 {
+    // `DotAnimations.GlowRange` (`LyricsAnimator.ts:150-155`): zero when waiting, luminous white halo once lit.
+    eval_spline(&[(0.0, 0.0), (0.55, 1.0), (1.0, 0.90)], fill)
+}
+
+fn dot_fill_ease(x: f32) -> f32 {
+    cubic_bezier(0.0, 0.25, 1.0, 0.58, x)
+}
+
+fn dot_exit_ease(x: f32) -> f32 {
+    cubic_bezier(0.25, 0.0, 1.0, 0.2, x)
+}
+
+fn dot_breath_ease(x: f32) -> f32 {
+    cubic_bezier(0.5, 0.02, 0.42, 0.98, x)
+}
+
+fn emphasis_ease(x: f32) -> f32 {
+    cubic_bezier(0.25, 0.1, 0.25, 1.0, x)
+}
+
+fn dot_breath(x: f32) -> f32 {
+    let extra = REFRESHED_DOTS_BREATH_SCALE;
+    if x < 0.5 {
+        1.0 + extra * dot_breath_ease(x * 2.0)
+    } else {
+        1.0 + extra - extra * dot_breath_ease((x - 0.5) * 2.0)
+    }
+}
+
+/// Exact 14-point piecewise `linear(...)` curve from Spicy Lyrics `src/css/Lyrics/Mixed.css:834`
+/// used for `.dotGroup` `pre-hidden` 0.4s collapse animation (with negative overshoot `-0.189` at `55.9%`).
+fn eval_pre_hidden_collapse_curve(t: f32) -> f32 {
+    const STOPS: [(f32, f32); 14] = [
+        (0.0, 0.0),
+        (0.094, -0.006),
+        (0.180, -0.029),
+        (0.433, -0.157),
+        (0.514, -0.185),
+        (0.559, -0.189),
+        (0.600, -0.182),
+        (0.639, -0.163),
+        (0.676, -0.133),
+        (0.723, -0.074),
+        (0.767, 0.006),
+        (0.850, 0.238),
+        (0.927, 0.566),
+        (1.0, 1.0),
+    ];
+    let x = t.clamp(0.0, 1.0);
+    for w in STOPS.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        if x <= x1 {
+            let u = ((x - x0) / (x1 - x0).max(1e-6)).clamp(0.0, 1.0);
+            return y0 + (y1 - y0) * u;
+        }
+    }
+    1.0
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RefreshedDotsFrame {
+    dot_opacities: [f32; 3],
+    #[cfg_attr(not(test), allow(dead_code))]
+    dot_fills: [f32; 3],
+    dot_scales: [f32; 3],
+    dot_y_offsets: [f32; 3],
+    dot_glows: [f32; 3],
+    group_scale: f32,
+    group_opacity: f32,
+    pre_hidden: bool,
+    /// Mirrors `Mixed.css:841-847`: CSS holds `.dotGroup { scale: 1 }` while `Active.pre-hidden`
+    /// so `animateRefreshedDot`'s `group_scale` never double-scales with CSS collapse.
+    css_scale: f32,
+    /// Smooth layout height openness `[0.0, 1.0]` (`LyricsVirtualizer.ts:68-69`: `0.5s cubic-bezier(0.22, 1, 0.36, 1)`).
+    layout_open: f32,
+}
+
+/// Deterministic computation of Spicy Lyrics interlude dots combining `animateRefreshedDot`
+/// (`LyricsAnimator.ts:969-1029`) with per-dot `DotAnimations` scale, upward hop, and radial glow
+/// (`LyricsAnimator.ts:128-156`) and smooth pre-hidden disappearance when vocal lyrics resume.
+fn compute_refreshed_dots_frame(
     pos_ms: u64,
     start_ms: u64,
     end_ms: u64,
-    is_active: bool,
-    motion_on: bool,
-    viewport: Rect,
-    fade_h: f32,
-) -> Rect {
-    let row_h = (font_size * 1.15).max(24.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(font_size * 3.0, row_h), egui::Sense::click());
-    if resp.clicked() {
-        // Handled by caller if needed; interlude dots sit at start_ms.
+    active: bool,
+) -> RefreshedDotsFrame {
+    if !active || end_ms <= start_ms || pos_ms < start_ms || pos_ms >= end_ms {
+        // Non-active `pre-hidden` collapse (`Mixed.css:834` 0.4s piecewise `linear()`).
+        let css_scale = if end_ms > start_ms && pos_ms >= end_ms {
+            let since_end = pos_ms.saturating_sub(end_ms) as f32;
+            if since_end < 400.0 {
+                (1.0 - eval_pre_hidden_collapse_curve(since_end / 400.0)).max(0.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        return RefreshedDotsFrame {
+            dot_opacities: [0.0; 3],
+            dot_fills: [0.0; 3],
+            dot_scales: [0.72; 3],
+            dot_y_offsets: [0.0; 3],
+            dot_glows: [0.0; 3],
+            group_scale: 1.0,
+            group_opacity: 0.0,
+            pre_hidden: true,
+            css_scale,
+            layout_open: 0.0,
+        };
     }
-    let cy = rect.center().y;
-    let edge_fade = if fade_h <= 1.0 {
+
+    let duration = (end_ms - start_ms) as f32;
+    let elapsed = (pos_ms - start_ms) as f32;
+    let exit_at = (duration - PRE_HIDDEN_DOT_LINE_MS - REFRESHED_DOTS_EXIT_GROW_MS).max(0.0);
+    let share = ((exit_at + REFRESHED_DOTS_EXIT_GROW_MS) / 3.0).max(1.0);
+
+    let mut dot_fills = [0.0_f32; 3];
+    let mut dot_opacities = [0.0_f32; 3];
+    let mut dot_scales = [0.72_f32; 3];
+    let mut dot_y_offsets = [0.0_f32; 3];
+    let mut dot_glows = [0.0_f32; 3];
+    for i in 0..3 {
+        let fi = i as f32;
+        let fill = if i < 2 {
+            dot_fill_ease(((elapsed - fi * share) / share).clamp(0.0, 1.0))
+        } else {
+            let from = fi * share;
+            let room = (exit_at - from).max(1.0);
+            let reached = (room / share).min(1.0);
+            if elapsed < exit_at {
+                reached * dot_fill_ease(((elapsed - from) / room).clamp(0.0, 1.0))
+            } else {
+                reached
+                    + (1.0 - reached)
+                        * ((elapsed - exit_at) / REFRESHED_DOTS_EXIT_GROW_MS).clamp(0.0, 1.0)
+            }
+        };
+        let enter_lin =
+            ((elapsed - fi * REFRESHED_DOTS_ENTER_STAGGER_MS) / REFRESHED_DOTS_ENTER_MS)
+                .clamp(0.0, 1.0);
+        let enter = enter_lin * enter_lin;
+        dot_fills[i] = fill;
+        dot_opacities[i] = (REFRESHED_DOTS_DIM + (REFRESHED_DOTS_LIT - REFRESHED_DOTS_DIM) * fill)
+            * enter;
+        dot_scales[i] = spicy_dot_scale(fill);
+        dot_y_offsets[i] = spicy_dot_y_offset(fill);
+        dot_glows[i] = spicy_dot_glow(fill) * enter;
+    }
+
+    let breath_scale = |at: f32| -> f32 {
+        let cycles = (exit_at / REFRESHED_DOTS_BREATH_MS).floor();
+        if cycles < 1.0 {
+            return 1.0;
+        }
+        let length = exit_at / cycles;
+        let phase = (at.clamp(0.0, exit_at) % length) / length;
+        dot_breath(phase)
+    };
+
+    let (group_scale, group_opacity) = if elapsed < exit_at {
+        (breath_scale(elapsed), 1.0)
+    } else if elapsed < exit_at + REFRESHED_DOTS_EXIT_GROW_MS {
+        let from = breath_scale(exit_at);
+        let top = 1.0 + REFRESHED_DOTS_BREATH_SCALE;
+        let t = ((elapsed - exit_at) / REFRESHED_DOTS_EXIT_GROW_MS).clamp(0.0, 1.0);
+        (from + (top - from) * emphasis_ease(t), 1.0)
+    } else {
+        let t = ((elapsed - exit_at - REFRESHED_DOTS_EXIT_GROW_MS) / REFRESHED_DOTS_EXIT_SHRINK_MS)
+            .clamp(0.0, 1.0);
+        let x = dot_exit_ease(t);
+        let s = 1.0
+            + REFRESHED_DOTS_BREATH_SCALE
+            + (REFRESHED_DOTS_EXIT_SCALE - 1.0 - REFRESHED_DOTS_BREATH_SCALE) * x;
+        (s, (1.0 - x).clamp(0.0, 1.0))
+    };
+
+    let pre_hidden_start = (duration - PRE_HIDDEN_DOT_LINE_MS).max(0.0);
+    let pre_hidden = elapsed >= pre_hidden_start;
+    // `Mixed.css:841-847`: `.BloomRenderer .line.musical-line.Active.pre-hidden .dotGroup { scale: 1 }`
+    let css_scale = 1.0;
+
+    let layout_open = if pre_hidden {
+        let close_t = ((elapsed - pre_hidden_start) / PRE_HIDDEN_DOT_LINE_MS).clamp(0.0, 1.0);
+        (1.0 - cubic_bezier(0.22, 1.0, 0.36, 1.0, close_t)).clamp(0.0, 1.0)
+    } else if elapsed < 320.0 {
+        cubic_bezier(0.22, 1.0, 0.36, 1.0, (elapsed / 320.0).clamp(0.0, 1.0))
+    } else {
+        1.0
+    };
+
+    RefreshedDotsFrame {
+        dot_opacities,
+        dot_fills,
+        dot_scales,
+        dot_y_offsets,
+        dot_glows,
+        group_scale,
+        group_opacity,
+        pre_hidden,
+        css_scale,
+        layout_open,
+    }
+}
+
+/// Paints a smooth, zero-banding GPU-interpolated radial white glow behind an active interlude dot
+/// (matching CSS `text-shadow` / `filter: drop-shadow` bloom without stepped concentric rings).
+fn paint_soft_radial_glow(painter: &egui::Painter, center: Pos2, radius: f32, glow_a: f32) {
+    const SEGS: usize = 32;
+    // 4 smooth Gaussian-approximating radial rings interpolated per-vertex by the GPU.
+    let rings: [(f32, f32); 4] = [
+        (radius * 0.90, 0.42),
+        (radius * 1.42, 0.17),
+        (radius * 2.02, 0.045),
+        (radius * 2.75, 0.0),
+    ];
+    let mut mesh = Mesh::default();
+    let center_col = Color32::from_white_alpha((255.0 * 0.48 * glow_a).round().clamp(0.0, 255.0) as u8);
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: egui::epaint::WHITE_UV,
+        color: center_col,
+    });
+    let mut ring_starts = [0u32; 4];
+    for (ri, &(rad, weight)) in rings.iter().enumerate() {
+        ring_starts[ri] = mesh.vertices.len() as u32;
+        let col = Color32::from_white_alpha((255.0 * weight * glow_a).round().clamp(0.0, 255.0) as u8);
+        for s in 0..SEGS {
+            let ang = (s as f32 / SEGS as f32) * std::f32::consts::TAU;
+            let (sn, cs) = ang.sin_cos();
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: Pos2::new(center.x + cs * rad, center.y + sn * rad),
+                uv: egui::epaint::WHITE_UV,
+                color: col,
+            });
+        }
+    }
+    // Center fan -> ring 0
+    for s in 0..SEGS as u32 {
+        let next = (s + 1) % SEGS as u32;
+        mesh.add_triangle(0, ring_starts[0] + s, ring_starts[0] + next);
+    }
+    // Quad strips between ring k and ring k+1
+    for ri in 0..3 {
+        let a = ring_starts[ri];
+        let b = ring_starts[ri + 1];
+        for s in 0..SEGS as u32 {
+            let next = (s + 1) % SEGS as u32;
+            mesh.add_triangle(a + s, b + s, b + next);
+            mesh.add_triangle(a + s, b + next, a + next);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_refreshed_interlude_dots(
+    ui: &mut Ui,
+    font_size: f32,
+    inter: crate::lrc::InterludeEvent,
+    frame: RefreshedDotsFrame,
+    viewport: Rect,
+    pad_h: f32,
+    fade_h: f32,
+) -> (Rect, Option<u64>) {
+    let full_h = (font_size * 1.18).max(26.0);
+    let row_h = (full_h * frame.layout_open).max(1.0);
+    let base_r = (font_size * 0.22).clamp(4.5, 9.2);
+    let spacing = base_r * 2.95;
+    let group_w = base_r * 2.4 + spacing * 2.0 + 8.0;
+    let col_w = ui.available_width().max(group_w);
+    let (row_rect, mut resp) = ui.allocate_exact_size(Vec2::new(col_w, row_h), egui::Sense::click());
+    if !frame.pre_hidden {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let seek = (!frame.pre_hidden && resp.clicked()).then_some(inter.start_ms);
+
+    let cy = row_rect.center().y;
+    let edge_fade = if fade_h <= 0.5 {
         1.0
     } else {
-        (smoothstep(0.0, fade_h, cy - viewport.top())
-            * smoothstep(0.0, fade_h, viewport.bottom() - cy))
+        (smoothstep(pad_h, pad_h + fade_h, cy - viewport.top())
+            * smoothstep(pad_h, pad_h + fade_h, viewport.bottom() - cy))
         .clamp(0.0, 1.0)
     };
-    let dur = end_ms.saturating_sub(start_ms).max(1) as f32;
-    let overall = if is_active {
-        ((pos_ms.saturating_sub(start_ms)) as f32 / dur).clamp(0.0, 1.0)
-    } else if pos_ms >= end_ms {
-        1.0
+    // Keep group scale gentle (subtle breath around 1.0) so per-dot wave scaling reads cleanly.
+    let breath_gentle = 1.0 + (frame.group_scale - 1.0) * 0.45;
+    let effective_group_scale = if frame.pre_hidden {
+        frame.group_scale * frame.css_scale
     } else {
-        0.0
+        breath_gentle * frame.css_scale
     };
-    let base_r = (font_size * 0.23).clamp(5.0, 10.0);
-    let spacing = base_r * 3.1;
-    let time_s = ui.input(|i| i.time) as f32;
+    let effective_group_alpha = frame.group_opacity * edge_fade;
+    if effective_group_alpha <= 0.004 || effective_group_scale <= 0.01 {
+        return (row_rect, seek);
+    }
+
+    // Align dot group flush with the vocal line edge (left for primary, right for opposite duet).
+    let group_cx = if inter.right_align {
+        row_rect.right() - base_r - spacing - 4.0
+    } else {
+        row_rect.left() + base_r + spacing + 4.0
+    };
     for i in 0..3 {
-        let seg_start = i as f32 / 3.0;
-        let local_p = ((overall - seg_start) * 3.0).clamp(0.0, 1.0);
-        let idle_pulse = if is_active && motion_on {
-            0.5 + 0.5 * (time_s * 3.2 - i as f32 * 0.9).sin()
-        } else {
-            0.5
-        };
-        let scale = if !is_active {
-            0.78
-        } else {
-            eval_spline(&[(0.0, 0.82), (0.70, 1.15), (1.0, 1.0)], local_p)
-                + 0.06 * idle_pulse * (1.0 - local_p)
-        };
-        let y_off = if is_active && motion_on {
-            eval_spline(&[(0.0, 0.0), (0.65, -0.15), (1.0, 0.0)], local_p) * font_size
-                - idle_pulse * 2.2 * (1.0 - local_p)
-        } else {
-            0.0
-        };
-        let alpha_f = if !is_active {
-            0.38
-        } else {
-            eval_spline(&[(0.0, 0.48), (0.55, 1.0), (1.0, 0.94)], local_p)
-                .max(0.46 + 0.18 * idle_pulse)
-        } * edge_fade;
-        let glow_f = if is_active {
-            eval_spline(&[(0.0, 0.0), (0.55, 1.0), (1.0, 0.55)], local_p) * edge_fade
-        } else {
-            0.0
-        };
-        let center = Pos2::new(rect.left() + base_r * 1.2 + i as f32 * spacing, cy + y_off);
-        if glow_f > 0.04 {
-            ui.painter().circle_filled(
-                center,
-                base_r * scale * 2.1,
-                Color32::from_white_alpha((32.0 * glow_f).round() as u8),
-            );
-            ui.painter().circle_filled(
-                center,
-                base_r * scale * 1.45,
-                Color32::from_white_alpha((68.0 * glow_f).round() as u8),
-            );
+        let dx = (i as f32 - 1.0) * spacing * effective_group_scale;
+        let dy = frame.dot_y_offsets[i] * font_size * effective_group_scale;
+        let center = Pos2::new(group_cx + dx, cy + dy);
+        let r = (base_r * frame.dot_scales[i] * effective_group_scale).max(0.8);
+        let dot_a = (frame.dot_opacities[i] * effective_group_alpha).clamp(0.0, 1.0);
+        let glow_a = (frame.dot_glows[i] * effective_group_alpha).clamp(0.0, 1.0);
+        if glow_a > 0.02 {
+            paint_soft_radial_glow(ui.painter(), center, r, glow_a);
         }
         ui.painter().circle_filled(
             center,
-            base_r * scale,
-            Color32::from_white_alpha((255.0 * alpha_f).round().clamp(0.0, 255.0) as u8),
+            r,
+            Color32::from_white_alpha((255.0 * dot_a).round().clamp(0.0, 255.0) as u8),
         );
     }
-    rect
+    (row_rect, seek)
 }
 
 fn compute_active_char_anims(
@@ -2772,10 +3363,14 @@ fn compute_active_char_anims(
     font_size: f32,
     motion_on: bool,
 ) -> Vec<CharAnim> {
+    const UNLIT_ALPHA: f32 = 0.34;
+    const LIT_ALPHA: f32 = 0.96;
+    const ALPHA_SPAN: f32 = LIT_ALPHA - UNLIT_ALPHA;
+
     let char_count = display.chars().count().max(1);
     let mut anims = vec![
         CharAnim {
-            alpha: 0.51,
+            alpha: UNLIT_ALPHA,
             glow: 0.0,
             blur_px: 4.0,
             y_offset: 0.0,
@@ -2809,7 +3404,7 @@ fn compute_active_char_anims(
             if c_start > prev_end {
                 let gap_sung = pos >= span.start_ms;
                 for item in &mut anims[prev_end..c_start] {
-                    item.alpha = if gap_sung { 1.0 } else { 0.51 };
+                    item.alpha = if gap_sung { LIT_ALPHA } else { UNLIT_ALPHA };
                     item.glow = if gap_sung { 0.14 } else { 0.0 };
                     item.blur_px = 4.5;
                 }
@@ -2819,16 +3414,16 @@ fn compute_active_char_anims(
             if word_chars > 0 {
                 if pos < span.start_ms {
                     for item in &mut anims[c_start..c_end] {
-                        item.alpha = 0.51;
+                        item.alpha = UNLIT_ALPHA;
                         item.glow = 0.0;
                     }
                 } else if pos >= span.end_ms {
                     let tail = ((pos - span.end_ms) as f32 / 420.0).clamp(0.0, 1.0);
-                    let glow = 0.42 * (1.0 - tail) + 0.44;
+                    let glow = 0.40 * (1.0 - tail) + 0.34;
                     for item in &mut anims[c_start..c_end] {
-                        item.alpha = 1.0;
+                        item.alpha = LIT_ALPHA;
                         item.glow = glow;
-                        item.blur_px = 5.5 + 5.5 * glow;
+                        item.blur_px = 5.0 + 5.0 * glow;
                     }
                 } else {
                     let dur = (span.end_ms - span.start_ms).max(1);
@@ -2842,15 +3437,15 @@ fn compute_active_char_anims(
                             let cursor_f = p * word_chars as f32;
                             let dist = (cursor_f - (k as f32 + 0.45)).abs();
                             let prox = (-dist * 0.55).exp();
-                            let warm_trail = if lp > 0.0 { 0.30 * (1.0 - p * 0.45) } else { 0.0 };
-                            let glow = (spicy_glow_spline(lp) * 0.96)
-                                .max(0.48 * prox)
+                            let warm_trail = if lp > 0.0 { 0.28 * (1.0 - p * 0.45) } else { 0.0 };
+                            let glow = (spicy_glow_spline(lp) * 0.92)
+                                .max(0.46 * prox)
                                 .max(warm_trail)
                                 .clamp(0.0, 1.0);
                             anims[ci] = CharAnim {
-                                alpha: 0.51 + 0.49 * lp,
+                                alpha: UNLIT_ALPHA + ALPHA_SPAN * lp,
                                 glow,
-                                blur_px: 4.0 + 11.5 * glow,
+                                blur_px: 4.0 + 10.5 * glow,
                                 y_offset: if motion_on {
                                     spicy_y_offset_spline(lp) * font_size * 1.45
                                 } else {
@@ -2861,12 +3456,12 @@ fn compute_active_char_anims(
                             let char_sweep =
                                 ((p * (word_chars as f32 + 0.75) - (k as f32 + 0.30)) / 0.95)
                                     .clamp(0.0, 1.0);
-                            let word_glow = spicy_glow_spline(p).max(0.30);
+                            let word_glow = spicy_glow_spline(p).max(0.28);
                             let glow = (word_glow * (0.55 + 0.45 * char_sweep)).clamp(0.0, 1.0);
                             anims[ci] = CharAnim {
-                                alpha: 0.51 + 0.49 * char_sweep,
+                                alpha: UNLIT_ALPHA + ALPHA_SPAN * char_sweep,
                                 glow,
-                                blur_px: 4.0 + 6.5 * glow,
+                                blur_px: 4.0 + 6.0 * glow,
                                 y_offset: if motion_on {
                                     spicy_y_offset_spline(p) * font_size
                                 } else {
@@ -2883,7 +3478,7 @@ fn compute_active_char_anims(
         if prev_end < char_count {
             let tail_sung = line.spans.last().is_some_and(|s| pos >= s.end_ms);
             for item in &mut anims[prev_end..char_count] {
-                item.alpha = if tail_sung { 1.0 } else { 0.51 };
+                item.alpha = if tail_sung { LIT_ALPHA } else { UNLIT_ALPHA };
                 item.glow = if tail_sung { 0.14 } else { 0.0 };
                 item.blur_px = 4.5;
             }
@@ -2945,9 +3540,9 @@ fn compute_active_char_anims(
             0.0
         };
         let sung_trail = if char_p >= 0.95 {
-            (0.82 * (1.0 - post_phrase_decay * 0.25)).max(0.62)
+            (0.76 * (1.0 - post_phrase_decay * 0.25)).max(0.56)
         } else {
-            0.34 + 0.42 * char_p
+            0.30 + 0.40 * char_p
         };
         let glow = head_glow.max(sung_trail).clamp(0.0, 1.0);
         let lift = if motion_on && char_p > 0.0 && char_p < 1.0 {
@@ -2956,9 +3551,9 @@ fn compute_active_char_anims(
             0.0
         };
         anims[ci] = CharAnim {
-            alpha: 0.53 + 0.47 * char_p,
+            alpha: UNLIT_ALPHA + ALPHA_SPAN * char_p,
             glow,
-            blur_px: 6.5 + 8.0 * glow,
+            blur_px: 6.0 + 7.5 * glow,
             y_offset: lift,
         };
     }
@@ -3114,13 +3709,21 @@ fn make_tinted_galley(
     std::sync::Arc::new(g)
 }
 
+/// Quantizes dynamic lyric font sizes to 2pt steps so dragging window/sidebar resize handles
+/// never floods `epaint`'s 2048x2048 font atlas with dozens of unique glyph caches (preventing
+/// atlas overflow and uncleared glyph-overwrite glitches).
+fn quantize_lyric_font_size(size: f32) -> f32 {
+    (size * 0.5).round().max(6.0) * 2.0
+}
+
 fn lyric_font(ui: &Ui, size: f32) -> egui::FontId {
+    let q_size = quantize_lyric_font_size(size);
     // Runtime #SpicyLyricsPage: SpicyLyrics 700 (fonts.spikerko.org/spicy-lyrics/LyricsBold.woff2).
     let family = egui::FontFamily::Name("lyrics".into());
     if ui.fonts(|f| f.families().contains(&family)) {
-        egui::FontId::new(size, family)
+        egui::FontId::new(q_size, family)
     } else {
-        bold(size)
+        bold(q_size)
     }
 }
 
@@ -3281,7 +3884,7 @@ fn make_vertical_line_galley(
             let a = if halo_pass {
                 (smooth_fill * ring_alpha * mask_a).round().clamp(0.0, 255.0) as u8
             } else {
-                ((0.52 + 0.48 * smooth_fill) * 255.0 * mask_a)
+                ((0.34 + 0.62 * smooth_fill) * 255.0 * mask_a)
                     .round()
                     .clamp(0.0, 255.0) as u8
             };
@@ -3304,6 +3907,7 @@ fn line_widget(
     lift_px: f32,
     scale: f32,
     blur_px: f32,
+    glow_t: f32,
     viewport: Rect,
     pad_h: f32,
     fade_h: f32,
@@ -3325,19 +3929,18 @@ fn line_widget(
     };
     let alloc_aligned = |ui: &mut Ui, galley_sz: Vec2, clickable: bool| -> (Rect, Rect, Pos2, egui::Response) {
         let sense = if clickable { egui::Sense::click() } else { egui::Sense::hover() };
-        let row_w = if right_align { col_w } else { galley_sz.x.min(col_w) };
-        let (row_rect, mut resp) = ui.allocate_exact_size(Vec2::new(row_w, galley_sz.y), sense);
+        let (row_rect, mut resp) = ui.allocate_exact_size(Vec2::new(col_w, galley_sz.y), sense);
         let text_rect = if right_align {
             Rect::from_min_size(
                 Pos2::new((row_rect.right() - galley_sz.x).max(row_rect.left()), row_rect.top()),
                 Vec2::new(galley_sz.x.min(col_w), galley_sz.y),
             )
         } else {
-            row_rect
+            Rect::from_min_size(row_rect.min, Vec2::new(galley_sz.x.min(col_w), galley_sz.y))
         };
         if clickable {
-            // Re-interact on generous pill hit bounds so gliding pointer up/down across lines never flickers.
-            let hit = text_rect.expand2(Vec2::new(14.0, 8.0));
+            // Span full column width so hovering anywhere along the rounded hover pill never flickers.
+            let hit = row_rect.expand2(Vec2::new(14.0, 8.0));
             resp = ui
                 .interact(hit, resp.id.with("pill"), egui::Sense::click())
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3356,11 +3959,12 @@ fn line_widget(
     let target = seek(&resp, &base_galley, origin);
 
     if let Some(pos) = word_position.filter(|_| !display.trim().is_empty()) {
-        if !rect.intersects(viewport.expand(18.0)) {
+        if !rect.intersects(viewport.expand(24.0)) {
             return (resp, text_rect, target);
         }
         let scaled_base = scale_galley_in_place(base_galley, scale);
-        // Line-synced mode (no word/syllable spans): authentic Spotify / Spicy Lyrics 180° top-to-bottom illumination wave!
+        // Line-synced mode (no word/syllable spans): authentic Spotify / Spicy Lyrics 180° top-to-bottom illumination wave
+        // + GPU 2-pass separable Gaussian outer glow + tight inner glow strictly behind razor-sharp glyphs.
         if line.spans.is_empty() {
             let start = line.time_ms.unwrap_or(pos);
             let raw_end = line
@@ -3374,47 +3978,7 @@ fn line_widget(
             } else {
                 1.0
             };
-            const OCT_DIRS: [(f32, f32); 8] = [
-                (1.0, 0.0),
-                (-1.0, 0.0),
-                (0.0, 1.0),
-                (0.0, -1.0),
-                (0.707, 0.707),
-                (-0.707, 0.707),
-                (0.707, -0.707),
-                (-0.707, -0.707),
-            ];
-            for dir in OCT_DIRS {
-                let halo = make_vertical_line_galley(
-                    &scaled_base,
-                    progress,
-                    true,
-                    dir,
-                    1.6,
-                    24.0,
-                    origin,
-                    viewport,
-                    pad_h,
-                    fade_h,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-            for dir in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                let halo = make_vertical_line_galley(
-                    &scaled_base,
-                    progress,
-                    true,
-                    dir,
-                    3.4,
-                    14.0,
-                    origin,
-                    viewport,
-                    pad_h,
-                    fade_h,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-            let fg = make_vertical_line_galley(
+            let fg_unmasked = make_vertical_line_galley(
                 &scaled_base,
                 progress,
                 false,
@@ -3423,10 +3987,34 @@ fn line_widget(
                 0.0,
                 origin,
                 viewport,
+                0.0,
+                0.0,
+            );
+            let gpu_params = super::lyrics_gpu::LyricGpuParams {
+                blur_sigma_pt: 0.0,
+                glow_sigma_pt: 6.8,
+                glow_strength: 0.42 * glow_t.max(0.35),
+                inner_glow_strength: 0.16 * glow_t.max(0.35),
+                opacity: 1.0,
+                viewport,
                 pad_h,
                 fade_h,
-            );
-            ui.painter().galley(origin, fg, Color32::WHITE);
+            };
+            if !super::lyrics_gpu::paint_line(ui, &fg_unmasked, origin, None, gpu_params) {
+                let fg = make_vertical_line_galley(
+                    &scaled_base,
+                    progress,
+                    false,
+                    (0.0, 0.0),
+                    0.0,
+                    0.0,
+                    origin,
+                    viewport,
+                    pad_h,
+                    fade_h,
+                );
+                ui.painter().galley(origin, fg, Color32::WHITE);
+            }
             return (resp, text_rect, target);
         }
         let char_anims = compute_active_char_anims(
@@ -3438,50 +4026,12 @@ fn line_widget(
             motion_on,
         );
         let row_char_map = map_galley_glyphs_to_chars(&scaled_base, display);
-        if char_anims.iter().any(|a| a.glow > 0.03) {
-            // Soft glyph-shaped text-shadow halo rings (Spicy Lyrics main.css:24)
-            const OCT_DIRS: [(f32, f32); 8] = [
-                (1.0, 0.0),
-                (-1.0, 0.0),
-                (0.0, 1.0),
-                (0.0, -1.0),
-                (0.707, 0.707),
-                (-0.707, 0.707),
-                (0.707, -0.707),
-                (-0.707, -0.707),
-            ];
-            for dir in OCT_DIRS {
-                let halo = make_tinted_galley(
-                    &scaled_base,
-                    &row_char_map,
-                    &char_anims,
-                    dir,
-                    0.16,
-                    true,
-                    origin,
-                    viewport,
-                    pad_h,
-                    fade_h,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-            for dir in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-                let halo = make_tinted_galley(
-                    &scaled_base,
-                    &row_char_map,
-                    &char_anims,
-                    dir,
-                    0.30,
-                    true,
-                    origin,
-                    viewport,
-                    pad_h,
-                    fade_h,
-                );
-                ui.painter().galley(origin, halo, Color32::WHITE);
-            }
-        }
-        let fg = make_tinted_galley(
+        let peak_glow = char_anims
+            .iter()
+            .map(|a| a.glow)
+            .fold(0.0_f32, f32::max);
+        let glow_factor = (peak_glow * glow_t.max(0.45)).clamp(0.0, 1.0);
+        let fg_unmasked = make_tinted_galley(
             &scaled_base,
             &row_char_map,
             &char_anims,
@@ -3490,66 +4040,55 @@ fn line_widget(
             false,
             origin,
             viewport,
+            0.0,
+            0.0,
+        );
+        let gpu_params = super::lyrics_gpu::LyricGpuParams {
+            blur_sigma_pt: 0.0,
+            glow_sigma_pt: 6.8,
+            glow_strength: 0.44 * glow_factor,
+            inner_glow_strength: 0.17 * glow_factor,
+            opacity: 1.0,
+            viewport,
             pad_h,
             fade_h,
-        );
-        ui.painter().galley(origin, fg, Color32::WHITE);
-        return (resp, text_rect, target);
-    }
-
-    if blur_px > 0.35 && word_position.is_none() {
-        if line_color.a() > 0 && rect.intersects(viewport.expand(18.0)) {
-            let scaled = scale_galley_in_place(base_galley, scale);
-            let a_target = (line_color.a() as f32 / 255.0).clamp(0.0, 0.999);
-            let tap_alpha = |w: f32| -> u8 {
-                (255.0 * (1.0 - (1.0 - a_target).powf(w))).round().clamp(1.0, 255.0) as u8
-            };
-            // 2-ring isotropic Gaussian disc kernel (13 radial taps, per-vertex Y-masked, `BlurMultiplier = 1.25`)
-            let g0 = mask_galley_vertical(
-                &scaled,
+        };
+        if !super::lyrics_gpu::paint_line(ui, &fg_unmasked, origin, None, gpu_params) {
+            let fg = make_tinted_galley(
+                &scaled_base,
+                &row_char_map,
+                &char_anims,
+                (0.0, 0.0),
+                0.0,
+                false,
                 origin,
                 viewport,
                 pad_h,
                 fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.30))),
             );
-            ui.painter().galley(origin, g0, Color32::WHITE);
-
-            let r1 = blur_px * 0.30;
-            let g1 = mask_galley_vertical(
-                &scaled,
-                origin,
-                viewport,
-                pad_h,
-                fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.075))),
-            );
-            for k in 0..6 {
-                let (s, c) = (k as f32 * std::f32::consts::TAU / 6.0).sin_cos();
-                ui.painter().galley(origin + Vec2::new(c * r1, s * r1), g1.clone(), Color32::WHITE);
-            }
-
-            let r2 = blur_px * 0.62;
-            let g2 = mask_galley_vertical(
-                &scaled,
-                origin,
-                viewport,
-                pad_h,
-                fade_h,
-                Some(Color32::from_white_alpha(tap_alpha(0.042))),
-            );
-            for k in 0..6 {
-                let (s, c) = (k as f32 * std::f32::consts::TAU / 6.0 + 0.52).sin_cos();
-                ui.painter().galley(origin + Vec2::new(c * r2, s * r2), g2.clone(), Color32::WHITE);
-            }
+            ui.painter().galley(origin, fg, Color32::WHITE);
         }
         return (resp, text_rect, target);
     }
 
-    if rect.intersects(viewport.expand(12.0)) {
+    if line_color.a() > 0 && rect.intersects(viewport.expand(24.0)) {
         let scaled = scale_galley_in_place(base_galley, scale);
-        let masked = mask_galley_vertical(&scaled, origin, viewport, pad_h, fade_h, Some(line_color));
-        ui.painter().galley(origin, masked, Color32::WHITE);
+        // Focused/hovered inactive lines replace blur with crisp glyphs + soft luminous white outline glow.
+        let outline_glow = blur_px < 0.35 && glow_t > 0.02;
+        let gpu_params = super::lyrics_gpu::LyricGpuParams {
+            blur_sigma_pt: if outline_glow { 0.0 } else { blur_px },
+            glow_sigma_pt: if outline_glow { 4.8 } else { 0.0 },
+            glow_strength: if outline_glow { 0.56 * glow_t } else { 0.0 },
+            inner_glow_strength: if outline_glow { 0.42 * glow_t } else { 0.0 },
+            opacity: (line_color.a() as f32 / 255.0).clamp(0.0, 1.0),
+            viewport,
+            pad_h,
+            fade_h,
+        };
+        if !super::lyrics_gpu::paint_line(ui, &scaled, origin, Some(Color32::WHITE), gpu_params) {
+            let masked = mask_galley_vertical(&scaled, origin, viewport, pad_h, fade_h, Some(line_color));
+            ui.painter().galley(origin, masked, Color32::WHITE);
+        }
     }
     (resp, text_rect, target)
 }
@@ -3559,6 +4098,28 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+pub(super) fn draw_animated_backdrop_sidebar(
+    ui: &Ui,
+    bounds: Rect,
+    track_id: Option<TrackId>,
+    target: [Color32; 4],
+    backdrop_tex: Option<egui::TextureHandle>,
+    motion_on: bool,
+    playing: bool,
+) -> (bool, f32) {
+    draw_animated_backdrop(
+        ui,
+        bounds,
+        track_id,
+        target,
+        backdrop_tex,
+        motion_on,
+        playing,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_animated_backdrop(
     ui: &Ui,
     bounds: Rect,
@@ -3567,8 +4128,13 @@ fn draw_animated_backdrop(
     backdrop_tex: Option<egui::TextureHandle>,
     motion_on: bool,
     playing: bool,
-) -> bool {
-    let id = ui.scope_id().with("lyrics-backdrop-state");
+    sidebar: bool,
+) -> (bool, f32) {
+    let id = ui.scope_id().with(if sidebar {
+        "sidebar-backdrop-state"
+    } else {
+        "lyrics-backdrop-state"
+    });
     let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.05);
 
     let mut state = ui
@@ -3587,24 +4153,16 @@ fn draw_animated_backdrop(
     state.set_target(track_id, target, backdrop_tex, motion_on);
 
     let smooth_t = state.advance_blend(dt, motion_on);
-
-    if motion_on {
-        let speed = if playing {
-            1.40 + 0.35 * (state.phase * 0.7).sin()
-        } else {
-            0.22
-        };
-        state.phase = (state.phase + dt * speed) % (std::f32::consts::TAU * 64.0);
-    }
+    let animating = state.advance_phase(dt, motion_on, playing);
 
     let rect = bounds;
     if let Some(ref cur_tex) = state.cur_tex {
         if smooth_t < 1.0 {
             if let Some(ref prev_tex) = state.prev_tex {
-                super::backdrop::paint(ui, rect, prev_tex, state.phase, 1.0, false, None);
+                super::backdrop::paint(ui, rect, prev_tex, state.phase, 1.0, sidebar, None);
             }
         }
-        super::backdrop::paint(ui, rect, cur_tex, state.phase, smooth_t, false, None);
+        super::backdrop::paint(ui, rect, cur_tex, state.phase, smooth_t, sidebar, None);
     } else {
         const N: u32 = 16;
         let mut mesh = Mesh::default();
@@ -3628,9 +4186,12 @@ fn draw_animated_backdrop(
                 }
                 let avg = [rgb[0] / sum, rgb[1] / sum, rgb[2] / sum];
                 let luma = 0.2126 * avg[0] + 0.7152 * avg[1] + 0.0722 * avg[2];
-                let sat_boost = 1.65;
-                let vignette = 0.62 * (1.0 - 0.24 * smoothstep(0.60, 1.0, v));
-                let [r, g, b] = avg.map(|c| ((luma + (c - luma) * sat_boost) * vignette).clamp(8.0, 232.0) as u8);
+                let sat_boost = if sidebar { 1.72 } else { 1.65 };
+                let vignette = (if sidebar { 0.58 } else { 0.62 })
+                    * (1.0 - 0.24 * smoothstep(0.60, 1.0, v));
+                let [r, g, b] = avg.map(|c| {
+                    ((luma + (c - luma) * sat_boost) * vignette).clamp(8.0, 232.0) as u8
+                });
                 mesh.colored_vertex(rect.lerp_inside(Vec2::new(u, v)), Color32::from_rgb(r, g, b));
                 if x < N && y < N {
                     let n = y * (N + 1) + x;
@@ -3642,9 +4203,9 @@ fn draw_animated_backdrop(
         ui.painter().add(egui::Shape::mesh(mesh));
     }
 
-    let crossfading = state.blend < 1.0;
+    let phase = state.phase;
     ui.data_mut(|d| d.insert_temp(id, state));
-    motion_on || crossfading
+    (animating, phase)
 }
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -4142,7 +4703,7 @@ fn render_popup_contents(app: &mut App, ui: &mut Ui, rect: Rect, native_vp: Opti
     card_ui
         .painter()
         .rect_filled(rect, CornerRadius::same(corner_r), Color32::from_rgb(8, 18, 62));
-    let animating_bd = draw_animated_backdrop(
+    let (animating_bd, _) = draw_animated_backdrop(
         &card_ui,
         rect,
         track_id,
@@ -4150,13 +4711,14 @@ fn render_popup_contents(app: &mut App, ui: &mut Ui, rect: Rect, native_vp: Opti
         backdrop_tex,
         motion_on,
         playing,
+        false,
     );
 
     if m.compact_bar {
         render_compact_pip_bar(app, &mut card_ui, rect, track.as_ref(), position, playing, motion_on, native_vp);
         if animating_bd || playing {
             if motion_on {
-                ctx.request_repaint();
+                ctx.request_repaint_after(Duration::from_millis(16));
             } else {
                 ctx.request_repaint_after(Duration::from_millis(42));
             }
@@ -4288,9 +4850,8 @@ fn render_popup_contents(app: &mut App, ui: &mut Ui, rect: Rect, native_vp: Opti
         );
         let mut lyr_ui = card_ui.new_child(egui::UiBuilder::new().id_salt("spicy-popup-lyr-box").max_rect(lyrics_rect));
         lyr_ui.set_clip_rect(vis_lyrics_rect.intersect(rect));
-        // Slim 4px translucent right scrollbar matching `9a4a97ec.jpg` & `02e48b2e.jpg`
-        let show_scroll_thumb = page_hover
-            || staged_mode == Some("hover")
+        // Slim 4px translucent auto-hiding right scrollbar matching Spotify Desktop
+        let force_scroll_thumb = staged_mode == Some("hover")
             || staged_mode == Some("f2")
             || ctx
                 .data(|d| d.get_temp::<bool>(egui::Id::NULL.with("spicy-popup-show-scrollbar")))
@@ -4305,17 +4866,19 @@ fn render_popup_contents(app: &mut App, ui: &mut Ui, rect: Rect, native_vp: Opti
             sc.dormant_background_opacity = 0.0;
             sc.active_background_opacity = 0.0;
             sc.interact_background_opacity = 0.0;
-            sc.dormant_handle_opacity = if show_scroll_thumb { 0.38 } else { 0.0 };
-            sc.active_handle_opacity = 0.52;
+            sc.dormant_handle_opacity = if force_scroll_thumb { 0.38 } else { 0.0 };
+            sc.active_handle_opacity = 0.50;
             sc.interact_handle_opacity = 0.68;
         }
         if let Some(ref lyrics) = lyr_opt {
             let credits = resolve_lyrics_credits(lyrics, &cur_artist);
+            let track_dur_ms = track.as_ref().map(|t| t.duration_ms);
             if let Some(ms) = render_lyrics_scroll_body(
                 &mut lyr_ui,
                 "spicy-popup-scroll",
                 lyrics,
                 track_id,
+                track_dur_ms,
                 position,
                 playing,
                 motion_on,
@@ -4886,7 +5449,7 @@ fn render_popup_contents(app: &mut App, ui: &mut Ui, rect: Rect, native_vp: Opti
     ctx.data_mut(|d| d.insert_temp(spring_id, sp));
     if animating_bd || playing || spring_busy {
         if motion_on {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(Duration::from_millis(42));
         }
@@ -5681,6 +6244,38 @@ mod tests {
     }
 
     #[test]
+    fn paused_settled_backdrop_freezes_phase_and_stops_idle_repaints() {
+        let mut state = BackdropState {
+            track: Some(1),
+            from: [Color32::BLACK; 4],
+            current: [Color32::WHITE; 4],
+            target: [Color32::WHITE; 4],
+            prev_tex: None,
+            cur_tex: None,
+            blend: 1.0,
+            phase: 1.25,
+        };
+        // Paused + settled crossfade: must neither drift phase nor request repaints.
+        assert!(!state.advance_phase(0.05, true, false));
+        assert_eq!(state.phase, 1.25);
+
+        // Paused + active track crossfade: stays animating until blend completes, without drifting phase.
+        state.blend = 0.25;
+        assert!(state.advance_phase(0.05, true, false));
+        assert_eq!(state.phase, 1.25);
+
+        // Playing + motion enabled: smoothly advances phase and stays animating.
+        state.blend = 1.0;
+        assert!(state.advance_phase(0.05, true, true));
+        assert!(state.phase > 1.25);
+
+        // Playing + reduced motion: freezes phase and stops animating once blend settles.
+        let frozen = state.phase;
+        assert!(!state.advance_phase(0.05, false, true));
+        assert_eq!(state.phase, frozen);
+    }
+
+    #[test]
     fn tracks_sharing_a_cover_do_not_fade_from_transparent() {
         let ctx = egui::Context::default();
         let cover = ctx.load_texture("shared-cover", egui::ColorImage::new([1, 1], vec![Color32::WHITE]), egui::TextureOptions::LINEAR);
@@ -5708,8 +6303,8 @@ mod tests {
         };
         let anims = compute_active_char_anims(&ttml_line, &ttml_line.text, 1900, Some(3200), 28.0, true);
         assert_eq!(anims.len(), ttml_line.text.chars().count());
-        assert!((anims[0].alpha - 1.0).abs() < 0.01);
-        assert!(anims[5].glow > 0.70 && anims[5].blur_px > 10.0, "active center char should glow brightly: {:?}", anims[5]);
+        assert!((anims[0].alpha - 0.96).abs() < 0.01);
+        assert!(anims[5].glow > 0.65 && anims[5].blur_px > 9.5, "active center char should glow: {:?}", anims[5]);
         assert!(anims[4].glow > 0.20, "recently sung char in held word keeps warm glow: {:?}", anims[4]);
 
         let lrc_line = LyricLine {
@@ -5721,17 +6316,17 @@ mod tests {
             background: false,
         };
         let mid_anims = compute_active_char_anims(&lrc_line, &lrc_line.text, 2200, Some(5000), 32.0, true);
-        assert!(mid_anims[0].alpha > 0.98, "leading chars already sung: {:?}", mid_anims[0]);
-        assert!(mid_anims.last().unwrap().alpha < 0.55, "trailing chars still unsung: {:?}", mid_anims.last());
-        assert!(mid_anims.iter().any(|a| a.glow > 0.65), "sweep head must emit strong character glow");
+        assert!(mid_anims[0].alpha > 0.94, "leading chars already sung: {:?}", mid_anims[0]);
+        assert!(mid_anims.last().unwrap().alpha < 0.38, "trailing chars still soft unsung: {:?}", mid_anims.last());
+        assert!(mid_anims.iter().any(|a| a.glow > 0.60), "sweep head must emit character glow");
     }
 
     #[test]
     fn interlude_markers_and_cinema_side_mirroring_behave_as_expected() {
-        assert!(is_instrumental_line(""));
-        assert!(is_instrumental_line("  ♪  "));
-        assert!(is_instrumental_line("..."));
-        assert!(!is_instrumental_line("Chẳng phải phép màu"));
+        assert!(crate::lrc::is_instrumental_text(""));
+        assert!(crate::lrc::is_instrumental_text("  ♪  "));
+        assert!(crate::lrc::is_instrumental_text("..."));
+        assert!(!crate::lrc::is_instrumental_text("Chẳng phải phép màu"));
 
         let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(1304.0, 724.0));
         let left = cinema_art_rect_sided(bounds, false);
@@ -5840,52 +6435,183 @@ mod tests {
     }
 
     #[test]
-    fn interlude_dots_deduplicate_intro_mid_and_consecutive_instrumental_lines() {
-        let mk = |t: u64, end: Option<u64>, text: &str| LyricLine {
-            time_ms: Some(t),
-            end_ms: end,
-            text: text.to_string(),
-            spans: Vec::new(),
-            right_align: false,
-            background: false,
-        };
+    fn refreshed_dots_animation_curves_breathing_exit_and_no_double_scaling() {
+        // 1. Exact Mixed.css:834 14-point pre-hidden collapse curve with negative overshoot at 55.9%.
+        assert_eq!(eval_pre_hidden_collapse_curve(0.0), 0.0);
+        assert!((eval_pre_hidden_collapse_curve(0.559) - (-0.189)).abs() < 0.001);
+        assert_eq!(eval_pre_hidden_collapse_curve(1.0), 1.0);
 
-        // 1. Intro: explicit `♪` before first vocal suppresses synthetic intro dots; absent -> allows synthetic.
-        let with_explicit_intro = vec![mk(0, Some(6_000), "♪"), mk(6_000, Some(10_000), "First vocal")];
-        assert!(!should_render_synthetic_intro_dots(&with_explicit_intro, 6_000));
-        let without_explicit_intro = vec![mk(6_000, Some(10_000), "First vocal")];
-        assert!(should_render_synthetic_intro_dots(&without_explicit_intro, 6_000));
+        // 2. Staggered quadratic entrance: dot 0 leads dot 1 leads dot 2.
+        let early = compute_refreshed_dots_frame(350, 0, 10_000, true);
+        assert!(early.dot_opacities[0] > early.dot_opacities[1]);
+        assert!(early.dot_opacities[1] > early.dot_opacities[2]);
+        assert!(!early.pre_hidden);
 
-        // 2. Mid-song: explicit `...` between two vocals suppresses synthetic mid-song gap dots.
-        let with_mid_explicit = vec![
-            mk(1_000, Some(5_000), "Verse 1"),
-            mk(6_000, Some(12_000), "..."),
-            mk(12_500, Some(16_000), "Verse 2"),
-        ];
-        assert_eq!(synthetic_mid_interlude_gap(&with_mid_explicit, 0), None);
-        assert_eq!(explicit_instrumental_span(&with_mid_explicit, 1), Some((6_000, 12_000, 1)));
+        // 3. Long interlude (10s -> exitAt = 8750ms -> 2 breath cycles): breathes smoothly up to ~1.20.
+        let breath_peak = compute_refreshed_dots_frame(2187, 0, 10_000, true);
+        assert!(breath_peak.group_scale > 1.15 && breath_peak.group_scale <= 1.201);
+        assert_eq!(breath_peak.group_opacity, 1.0);
+        assert!(breath_peak.dot_fills[0] > breath_peak.dot_fills[1]);
+        assert!(breath_peak.dot_fills[1] >= breath_peak.dot_fills[2]);
 
-        // 3. Consecutive explicit instrumental/blank lines collapse to a SINGLE span on index 0.
-        let consecutive = vec![
-            mk(10_000, Some(14_000), ""),
-            mk(14_000, Some(18_000), "♪"),
-            mk(20_000, Some(24_000), "Chorus"),
-        ];
-        assert_eq!(explicit_instrumental_span(&consecutive, 0), Some((10_000, 18_000, 1)));
-        assert_eq!(explicit_instrumental_span(&consecutive, 1), None);
+        // 4. Short interlude (3.5s -> exitAt = 2250ms < 4000ms): no breath cycles -> stays flat 1.0 before exit.
+        let short_mid = compute_refreshed_dots_frame(1100, 0, 3_500, true);
+        assert!((short_mid.group_scale - 1.0).abs() < 1e-4);
 
-        // 4. Short (< 2.2s) blank LRC spacer does NOT spawn spurious `• • •`.
-        let short_spacer = vec![
-            mk(10_000, Some(11_000), ""),
-            mk(11_200, Some(15_000), "Next vocal"),
-        ];
-        assert_eq!(explicit_instrumental_span(&short_spacer, 0), None);
+        // 5. Exit grow phase (exitAt..exitAt+750ms) swells toward 1.20 while last dot reaches full fill.
+        let exit_grow_end = compute_refreshed_dots_frame(9_499, 0, 10_000, true);
+        assert!(exit_grow_end.group_scale > 1.18);
+        assert!(exit_grow_end.dot_fills[2] > 0.99);
+        assert_eq!(exit_grow_end.group_opacity, 1.0);
 
-        // 5. Pure vocal gap >= 3.5s with NO explicit instrumental line still gets synthetic dots.
-        let pure_gap = vec![
-            mk(1_000, Some(5_000), "Verse 1"),
-            mk(10_000, Some(14_000), "Verse 2"),
-        ];
-        assert_eq!(synthetic_mid_interlude_gap(&pure_gap, 0), Some((5_000, 10_000)));
+        // 6. Active.pre-hidden (last 500ms): shrinks to 0.50, fades to 0.0, holds css_scale == 1.0 (NO double scaling!),
+        //    and smoothly collapses layout_open -> 0.0.
+        let pre_mid = compute_refreshed_dots_frame(9_625, 0, 10_000, true);
+        assert!(pre_mid.pre_hidden);
+        assert_eq!(pre_mid.css_scale, 1.0, "Mixed.css:841-847 must hold CSS scale=1 to prevent double scaling");
+        assert!(pre_mid.group_scale < 1.20 && pre_mid.group_scale > 0.50);
+        assert!(pre_mid.group_opacity < 1.0 && pre_mid.group_opacity > 0.0);
+        assert!(pre_mid.layout_open < 1.0 && pre_mid.layout_open > 0.0);
+
+        let pre_end = compute_refreshed_dots_frame(9_999, 0, 10_000, true);
+        assert!((pre_end.group_scale - 0.5).abs() < 0.01);
+        assert!(pre_end.group_opacity < 0.01);
+        assert!(pre_end.layout_open < 0.02);
+
+        // 7. Inactive / seek out of interlude cleanly collapses everything to 0.
+        let inactive = compute_refreshed_dots_frame(10_500, 0, 10_000, false);
+        assert_eq!(inactive.layout_open, 0.0);
+        assert_eq!(inactive.group_opacity, 0.0);
+    }
+
+    #[test]
+    fn focus_falloff_blur_increases_and_opacity_decreases_with_distance() {
+        let ctx = egui::Context::default();
+        let mut results = Vec::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            for dist in 0..=5usize {
+                let target = compute_lyric_visual_state(
+                    true,
+                    false,
+                    Some(0),
+                    dist,
+                    dist,
+                    false,
+                    dist == 0,
+                    false,
+                    false,
+                    false,
+                );
+                let visual = line_style(ui, "test-falloff", dist, target, false);
+                results.push(visual);
+            }
+        });
+        out.textures_delta.clear();
+        assert_eq!(results[0].opacity, 1.0, "active line must be full opacity");
+        assert_eq!(results[0].blur_sigma_pt, 0.0, "active line must have zero blur");
+        assert_eq!(results[0].glow_strength, 1.0, "active line must emit glow");
+        assert_eq!(results[0].scale, 1.0, "active syllable line rests at 1.0 scale");
+        for d in 1..=5 {
+            assert!(
+                results[d].blur_sigma_pt > results[d - 1].blur_sigma_pt,
+                "Gaussian blur sigma must strictly increase with distance (d={d})"
+            );
+            assert!(
+                results[d].opacity < results[d - 1].opacity,
+                "inactive opacity must strictly decrease with distance (d={d})"
+            );
+            assert_eq!(results[d].glow_strength, 0.0, "inactive lines must not glow");
+            assert_eq!(results[d].scale, 0.98, "inactive lines rest at 0.98 scale");
+        }
+    }
+
+    #[test]
+    fn manual_scroll_and_hover_focus_replace_blur_with_soft_outline_glow_below_singing_intensity() {
+        // Hovering or focusing a scrolled inactive line stays crisp (`blur = 0`) with a soft outline
+        // glow halo while staying clearly softer than the full-opacity active singing line.
+        let hovered = compute_lyric_visual_state(true, false, Some(5), 5, 0, false, false, false, true, false);
+        assert_eq!(hovered.blur_sigma_pt, 0.0, "hovered line must render crisp without blur");
+        assert!(hovered.opacity > 0.55 && hovered.opacity < 0.78);
+        assert!(hovered.glow_strength > 0.4 && hovered.glow_strength < 0.85, "hovered line emits soft outline glow");
+
+        let browse_center = compute_lyric_visual_state(true, false, Some(5), 5, 0, false, false, false, false, true);
+        assert_eq!(browse_center.blur_sigma_pt, 0.0, "scrolled focal line stays crisp");
+        assert!(browse_center.opacity > 0.45 && browse_center.opacity < hovered.opacity);
+        assert!(browse_center.glow_strength > 0.2 && browse_center.glow_strength < hovered.glow_strength);
+
+        let neighbor1 = compute_lyric_visual_state(true, false, Some(5), 6, 1, false, false, false, false, false);
+        let neighbor2 = compute_lyric_visual_state(true, false, Some(5), 7, 2, false, false, false, false, false);
+        assert!(neighbor1.blur_sigma_pt > 0.5 && neighbor1.blur_sigma_pt < neighbor2.blur_sigma_pt);
+        assert!(neighbor1.opacity > neighbor2.opacity);
+        assert_eq!(neighbor1.glow_strength, 0.0, "unfocused neighbors must not glow");
+
+        let singing = compute_lyric_visual_state(true, false, Some(5), 2, 3, false, true, false, false, false);
+        assert_eq!(singing.blur_sigma_pt, 0.0);
+        assert_eq!(singing.opacity, 1.0);
+        assert_eq!(singing.glow_strength, 1.0, "true singing line remains strongest even while user browses");
+    }
+
+    #[test]
+    fn lyric_font_size_quantization_bounds_unique_atlas_sizes_during_resize() {
+        let unique: std::collections::BTreeSet<i32> = (240..=440)
+            .map(|tenths| quantize_lyric_font_size(tenths as f32 / 10.0) as i32)
+            .collect();
+        assert!(
+            unique.len() <= 11,
+            "2pt quantization must bound unique lyric font sizes across full resize sweep, got {unique:?}"
+        );
+        assert!(unique.iter().all(|&s| s % 2 == 0));
+    }
+
+    #[test]
+    fn pending_seek_pins_clicked_line_across_async_and_coarse_audio_seek_without_flashing_previous_line() {
+        let mut follow = LyricsFollowState::default();
+        // Forward click to line 5 (40_000ms) from 5_000ms.
+        follow.pending_seek = Some(PendingLyricSeek {
+            line_index: 5,
+            target_ms: 40_000,
+            origin_pos_ms: 5_000,
+            clicked_at: 10.0,
+        });
+        // 1. Frame immediately after click (async Cmd::Seek not applied yet -> still at 5_016ms):
+        assert_eq!(follow.resolve_effective_pos(10.016, 5_016, true), (40_000, Some(5)));
+        // 2. Coarse keyframe seek lands 450ms early (39_550ms < 40_000ms): must stay pinned on line 5 (never line 4!).
+        assert_eq!(follow.resolve_effective_pos(10.08, 39_550, true), (40_000, Some(5)));
+        // 3. Playback crosses target_ms (40_020ms): releases cleanly to live playback clock.
+        assert_eq!(follow.resolve_effective_pos(10.55, 40_020, true), (40_020, None));
+        assert!(follow.pending_seek.is_none());
+
+        // Backward click to line 1 (24_440ms) from 90_000ms.
+        follow.pending_seek = Some(PendingLyricSeek {
+            line_index: 1,
+            target_ms: 24_440,
+            origin_pos_ms: 90_000,
+            clicked_at: 20.0,
+        });
+        // Stale pre-seek clock (90_016ms) right after click must stay pinned on line 1 (not release early!).
+        assert_eq!(follow.resolve_effective_pos(20.02, 90_016, true), (24_440, Some(1)));
+        // Coarse backward seek lands at 23_900ms (inside interlude before line 1): stays pinned on line 1!
+        assert_eq!(follow.resolve_effective_pos(20.10, 23_900, true), (24_440, Some(1)));
+        // Paused at coarse seek landing (23_900ms) stays pinned even after 5 seconds without snapping up to line 0.
+        assert_eq!(follow.resolve_effective_pos(25.0, 23_900, false), (24_440, Some(1)));
+        // Playback resumes and crosses 24_440ms: releases cleanly.
+        assert_eq!(follow.resolve_effective_pos(25.6, 24_460, true), (24_460, None));
+        assert!(follow.pending_seek.is_none());
+    }
+
+    #[test]
+    fn refreshed_dots_exhibit_sequential_per_dot_scale_hop_glow_and_vanish_when_vocals_resume() {
+        // 15s interlude: at 5.2s (~35%), dot 0 is lit & glowing, dot 1 is mid-hop upward, dot 2 is still small & unlit.
+        let mid = compute_refreshed_dots_frame(5_200, 0, 15_000, true);
+        assert!(mid.dot_scales[0] > mid.dot_scales[2], "lit dot 0 must be larger than waiting dot 2");
+        assert!(mid.dot_glows[0] > 0.7 && mid.dot_glows[2] < 0.05, "lit dot 0 glows while waiting dot 2 stays unlit");
+        assert!(mid.dot_y_offsets[1] < mid.dot_y_offsets[2], "activating dot 1 must hop upward above resting dot 2");
+        assert_eq!(mid.layout_open, 1.0);
+
+        // Once vocal lyrics resume at 15_000ms, the interlude collapses completely to 0 height and 0 opacity.
+        let resumed = compute_refreshed_dots_frame(15_000, 0, 15_000, false);
+        assert_eq!(resumed.layout_open, 0.0);
+        assert_eq!(resumed.group_opacity, 0.0);
+        assert!(resumed.dot_glows.iter().all(|&g| g == 0.0));
     }
 }

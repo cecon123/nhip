@@ -3,6 +3,7 @@
 pub mod icons;
 mod backdrop;
 mod lyrics;
+mod lyrics_gpu;
 mod overlays;
 mod pages;
 mod player_bar;
@@ -27,6 +28,21 @@ use overlays::menu_row;
 use pages::{item_of, paint_item_cover};
 use widgets::*;
 
+/// Critically-damped exponential slide step for full-window Cinema transition.
+/// Clamping `dt` to `<= 28ms` prevents the first layout frame from teleporting across the screen,
+/// while smooth exponential deceleration eliminates the sluggish ramp-up of symmetric cubic easing.
+fn step_cinema_slide(current: f32, target: f32, dt: f32) -> (f32, bool) {
+    let diff = target - current;
+    if diff.abs() < 0.0025 {
+        return (target, false);
+    }
+    let dt = dt.clamp(0.001, 0.028);
+    let k = 1.0 - (-dt * 12.5).exp();
+    let next = (current + diff * k).clamp(0.0, 1.0);
+    let still_moving = (target - next).abs() >= 0.0025;
+    (if still_moving { next } else { target }, still_moving)
+}
+
 pub fn draw(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     let surface = app.data.settings.surface_style;
@@ -38,28 +54,42 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
 
     let want_cinema =
         app.route == Route::Lyrics && (app.lyrics_cinema || app.lyrics_fullscreen.is_some());
-    let raw_cinema_t = if let Some(forced) = ui
+    let target_cinema = if want_cinema { 1.0_f32 } else { 0.0_f32 };
+    let slide_id = Id::NULL.with("cinema-slide-progress");
+    let (cinema_ease, cinema_animating) = if let Some(forced) = ui
         .ctx()
         .data(|d| d.get_temp::<f32>(Id::NULL.with("cinema-slide-override")))
     {
-        forced.clamp(0.0, 1.0)
+        (forced.clamp(0.0, 1.0), false)
     } else if app.screenshot.is_some() || !app.data.settings.effective_lyrics_motion() {
-        if want_cinema { 1.0 } else { 0.0 }
+        ui.ctx().data_mut(|d| d.insert_temp(slide_id, target_cinema));
+        (target_cinema, false)
     } else {
-        ui.ctx()
-            .animate_bool_with_time(Id::NULL.with("cinema-slide-progress"), want_cinema, 0.44)
+        let cur = ui.ctx().data(|d| d.get_temp::<f32>(slide_id)).unwrap_or(target_cinema);
+        let dt = ui.input(|i| i.unstable_dt);
+        let (next, moving) = step_cinema_slide(cur, target_cinema, dt);
+        ui.ctx().data_mut(|d| d.insert_temp(slide_id, next));
+        (next, moving)
     };
-    let cinema_ease = if raw_cinema_t < 0.5 {
-        4.0 * raw_cinema_t * raw_cinema_t * raw_cinema_t
-    } else {
-        1.0 - (-2.0 * raw_cinema_t + 2.0).powi(3) * 0.5
-    };
+    if cinema_animating {
+        ui.ctx().request_repaint();
+    }
+    // Signal underlying center lyrics panel to skip redundant offscreen GPU blur passes while the
+    // full-window cinema stage is already sliding over it, keeping frame pacing rock-solid at 60–144fps.
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(
+            Id::NULL.with("cinema-slide-obscuring"),
+            cinema_ease > 0.15 && cinema_ease < 0.999,
+        );
+    });
 
     if cinema_ease >= 0.999 {
         if app.lyrics_fullscreen.is_none() {
             window_drag(ui, top);
         }
-        let mut stage = ui.new_child(UiBuilder::new().id_salt("lyrics-fullscreen").max_rect(full));
+        // Share identical `id_salt("lyrics-cinema-stage")` with the sliding overlay so ScrollArea,
+        // LyricsFollowState, BackdropState, and line animations never reset or snap on landing.
+        let mut stage = ui.new_child(UiBuilder::new().id_salt("lyrics-cinema-stage").max_rect(full));
         stage.set_clip_rect(full);
         lyrics::draw(app, &mut stage);
         let menu = Rect::from_center_size(Pos2::new(top.left() + 34.0, top.center().y), Vec2::splat(28.0));
@@ -123,11 +153,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
     top_bar(app, ui, top);
 
     let saved_collapsed = app.data.settings.left_collapsed;
+    let panel_opacity = app.data.settings.panel_opacity.clamp(0.10, 0.95);
     app.data.settings.left_collapsed = effective_collapsed;
-    panel(ui, left, "library", surface, |ui| sidebar::draw(app, ui));
+    panel(ui, left, "library", surface, panel_opacity, |ui| sidebar::draw(app, ui));
     app.data.settings.left_collapsed = saved_collapsed;
 
-    panel(ui, main, "main", surface, |ui| pages::draw(app, ui));
+    panel(ui, main, "main", surface, panel_opacity, |ui| pages::draw(app, ui));
 
     if right_w > 0.0 {
         let right = Rect::from_min_max(Pos2::new(body.right() - right_w, body.top()), body.max);
@@ -155,12 +186,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
                         color: Color32::from_black_alpha(190),
                     };
                     ui.painter().add(shadow.as_shape(right, card_radius(RADIUS)));
-                    panel(ui, right, "right-overlay", surface, |ui| right_panel::draw(app, ui));
+                    panel(ui, right, "right-overlay", surface, panel_opacity, |ui| right_panel::draw(app, ui));
                     let edge = Rect::from_min_max(Pos2::new(right.left() - GAP, right.top()), Pos2::new(right.left(), right.bottom()));
                     resize_right(app, ui, edge, body.width() - left_w - GAP * 2.0);
                 });
         } else {
-            panel(ui, right, "right", surface, |ui| right_panel::draw(app, ui));
+            panel(ui, right, "right", surface, panel_opacity, |ui| right_panel::draw(app, ui));
             resize_right(
                 app,
                 ui,
@@ -182,21 +213,36 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
 
     player_bar::draw(app, ui, bar);
 
-    // Slide-from-bottom / Slide-to-bottom (`translateY(100%)`) transition when entering or exiting Cinema View.
+    // Smooth elevated sheet rise + crossfade transition when entering or exiting full-window Cinema View.
+    // Shares `id_salt("lyrics-cinema-stage")` with the settled full-window stage for zero jump on landing.
     if cinema_ease > 0.001 {
-        let slide_y = full.height() * (1.0 - cinema_ease);
-        let slide_rect = full.translate(Vec2::new(0.0, slide_y));
         let layer = LayerId::new(Order::Foreground, Id::NULL.with("cinema-slide-layer"));
+        let scrim_painter = ui.ctx().layer_painter(layer);
+        scrim_painter.rect_filled(
+            full,
+            0.0,
+            Color32::from_black_alpha((175.0 * cinema_ease).round().clamp(0.0, 255.0) as u8),
+        );
+        let max_rise = (full.height() * 0.24).min(210.0);
+        let slide_y = max_rise * (1.0 - cinema_ease);
+        let slide_rect = full.translate(Vec2::new(0.0, slide_y));
+        let shadow = egui::epaint::Shadow {
+            offset: [0, -10],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha((130.0 * cinema_ease).round().clamp(0.0, 255.0) as u8),
+        };
+        let top_rad = ((1.0 - cinema_ease) * 16.0).round() as u8;
+        scrim_painter.add(shadow.as_shape(slide_rect, egui::CornerRadius::same(top_rad)));
+
         let mut stage = ui.new_child(
             UiBuilder::new()
                 .layer_id(layer)
-                .id_salt("lyrics-fullscreen-slide")
+                .id_salt("lyrics-cinema-stage")
                 .max_rect(slide_rect),
         );
         stage.set_clip_rect(full.intersect(slide_rect));
-        stage
-            .painter()
-            .rect_filled(slide_rect, 0.0, Color32::from_black_alpha((220.0 * cinema_ease) as u8));
+        stage.set_opacity((cinema_ease * 1.45).clamp(0.0, 1.0));
         let prev_cinema = app.lyrics_cinema;
         let prev_route = app.route.clone();
         app.lyrics_cinema = true;
@@ -242,6 +288,24 @@ mod layout_tests {
         assert_eq!(dock_or_overlay_right(696.0, Some(354.0)), (280.0, false));
         // Wide enough for 416px main + 354px right docks without overlay.
         assert_eq!(dock_or_overlay_right(800.0, Some(354.0)), (354.0, false));
+    }
+
+    #[test]
+    fn cinema_slide_is_monotonic_clamps_first_frame_spike_and_settles() {
+        // Even if the initial layout frame stalls for 120ms, dt clamping prevents jumping > 35%.
+        let (first, moving) = super::step_cinema_slide(0.0, 1.0, 0.12);
+        assert!(moving && first > 0.15 && first < 0.35, "first={first}");
+        // Converges smoothly to 1.0 within ~0.55s at 60fps.
+        let mut p = 0.0_f32;
+        for _ in 0..36 {
+            let (next, _) = super::step_cinema_slide(p, 1.0, 1.0 / 60.0);
+            assert!(next >= p, "must advance monotonically");
+            p = next;
+        }
+        assert_eq!(p, 1.0);
+        // Reverses smoothly mid-flight back to 0.0 without snapping.
+        let (rev, rev_moving) = super::step_cinema_slide(0.6, 0.0, 1.0 / 60.0);
+        assert!(rev_moving && rev < 0.6 && rev > 0.4);
     }
 }
 
@@ -299,10 +363,12 @@ fn main_menu(app: &mut App, ui: &Ui, resp: &egui::Response) {
     egui::Popup::menu(resp)
         .frame(menu_frame(ui.style()))
         .show(|ui| {
-            ui.set_min_width(190.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.set_min_width(156.0);
 
             ui.menu_button(t("Tệp", "File"), |ui| {
-                ui.set_min_width(230.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_min_width(196.0);
                 if menu_row(ui, Some(Icon::Plus), t("Danh sách phát mới", "New Playlist"), Some("Ctrl+N"), false, true).clicked() {
                     out.push(Action::CreatePlaylist(None));
                     ui.close();
@@ -323,7 +389,8 @@ fn main_menu(app: &mut App, ui: &Ui, resp: &egui::Response) {
             });
 
             ui.menu_button(t("Chỉnh sửa", "Edit"), |ui| {
-                ui.set_min_width(230.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_min_width(196.0);
                 if menu_row(ui, Some(Icon::Search), t("Tìm kiếm", "Search"), Some("Ctrl+L"), false, true).clicked() {
                     app.focus_search = true;
                     app.search_dropdown_open = true;
@@ -343,7 +410,8 @@ fn main_menu(app: &mut App, ui: &Ui, resp: &egui::Response) {
             });
 
             ui.menu_button(t("Xem", "View"), |ui| {
-                ui.set_min_width(250.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_min_width(208.0);
                 let z = ui.ctx().zoom_factor();
                 if menu_row(ui, None, t("Phóng to", "Zoom In"), Some("Ctrl++"), false, z < 1.5).clicked() {
                     ui.ctx().set_zoom_factor((z + 0.1).min(1.5));
@@ -382,7 +450,8 @@ fn main_menu(app: &mut App, ui: &Ui, resp: &egui::Response) {
             });
 
             ui.menu_button(t("Phát nhạc", "Playback"), |ui| {
-                ui.set_min_width(240.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_min_width(200.0);
                 let play_lbl = if app.is_playing() { t("Tạm dừng", "Pause") } else { t("Phát", "Play") };
                 let play_ic = if app.is_playing() { Icon::Pause } else { Icon::Play };
                 if menu_row(ui, Some(play_ic), play_lbl, Some("Space"), false, true).clicked() {
@@ -431,7 +500,8 @@ fn main_menu(app: &mut App, ui: &Ui, resp: &egui::Response) {
             });
 
             ui.menu_button(t("Trợ giúp", "Help"), |ui| {
-                ui.set_min_width(220.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.set_min_width(188.0);
                 if menu_row(ui, Some(Icon::Info), t("Phím tắt", "Keyboard Shortcuts"), Some("Ctrl+/"), false, true).clicked() {
                     open_help = true;
                     ui.close();
@@ -520,49 +590,53 @@ fn draw_window_surface(app: &mut App, ui: &mut Ui, full: Rect, surface: SurfaceS
         return;
     }
 
-    // Soft ambient blurred artwork or deep frosted slate wash behind translucent glass panels.
-    ui.painter().rect_filled(full, 0.0, Color32::from_rgb(0x07, 0x09, 0x0c));
-    let cover_tex = app.current_track().map(|t| {
-        let key = t.cover_key();
-        app.art.backdrop_texture(ui.ctx(), &key, t.art_source())
-    });
-    if let Some(tex) = cover_tex {
-        let uv = Rect::from_min_max(Pos2::new(0.08, 0.08), Pos2::new(0.92, 0.92));
-        let tint = match surface {
-            SurfaceStyle::AmbientBlur => Color32::from_rgba_unmultiplied(230, 235, 245, 138),
-            SurfaceStyle::Acrylic => Color32::from_rgba_unmultiplied(195, 212, 232, 92),
-            SurfaceStyle::Standard => Color32::TRANSPARENT,
-        };
-        ui.painter().image(tex.id(), full, uv, tint);
-    } else {
-        // Rich subtle emerald-indigo atmospheric bloom when idle.
-        let glow_l = Pos2::new(full.left() + full.width() * 0.22, full.top() + full.height() * 0.24);
-        let glow_r = Pos2::new(full.left() + full.width() * 0.78, full.top() + full.height() * 0.72);
-        ui.painter().circle_filled(glow_l, full.width() * 0.42, Color32::from_rgba_unmultiplied(24, 118, 72, 42));
-        ui.painter().circle_filled(glow_r, full.width() * 0.45, Color32::from_rgba_unmultiplied(36, 78, 138, 44));
+    // Transparent root framebuffer + native Windows 11 DWM Mica / Mica Alt / Acrylic (`app.rs::apply_window_surface`):
+    // keep the veil cleanly parameterized so users can dial from ultra-clear glass to deep smoked tint.
+    let op = app.data.settings.surface_opacity.clamp(0.0, 0.95);
+    let tint_strength = app.data.settings.surface_tint_strength.clamp(0.0, 1.0);
+    let veil_scale = match surface {
+        SurfaceStyle::Acrylic => 0.56,
+        SurfaceStyle::Mica => 0.34,
+        SurfaceStyle::MicaAlt => 0.40,
+        SurfaceStyle::Standard => 1.0,
+    };
+    let tint_a = (op * veil_scale * 255.0).round().clamp(0.0, 215.0) as u8;
+    if tint_a > 0 {
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_rgba_unmultiplied(10, 12, 16, tint_a));
     }
 
-    if surface == SurfaceStyle::Acrylic {
-        // Frosted Acrylic dark tint + cool top specular veil.
-        ui.painter().rect_filled(full, 0.0, Color32::from_rgba_unmultiplied(12, 16, 22, 152));
-        let top_sheen = Rect::from_min_size(full.min, Vec2::new(full.width(), TOP_BAR));
-        ui.painter().rect_filled(top_sheen, 0.0, Color32::from_white_alpha(8));
-    } else {
-        ui.painter().rect_filled(full, 0.0, Color32::from_rgba_unmultiplied(8, 10, 14, 118));
+    // Optional album-art ambient glow blended smoothly over Mica/Acrylic when `surface_tint_strength > 0`.
+    if tint_strength > 0.01 {
+        if let Some(t) = app.current_track() {
+            let key = t.cover_key();
+            let tex = app.art.backdrop_texture(ui.ctx(), &key, t.art_source());
+            let uv = Rect::from_min_max(Pos2::new(0.08, 0.08), Pos2::new(0.92, 0.92));
+            let art_a = (tint_strength * 68.0).round().clamp(1.0, 72.0) as u8;
+            ui.painter()
+                .image(tex.id(), full, uv, Color32::from_rgba_unmultiplied(220, 232, 245, art_a));
+        }
     }
 }
 
-fn panel(ui: &mut Ui, rect: Rect, id: &str, surface: SurfaceStyle, add: impl FnOnce(&mut Ui)) {
+fn panel(ui: &mut Ui, rect: Rect, id: &str, surface: SurfaceStyle, panel_opacity: f32, add: impl FnOnce(&mut Ui)) {
+    let op = panel_opacity.clamp(0.10, 0.95);
     let (fill, rim) = match surface {
         SurfaceStyle::Standard => (PANEL, None),
-        SurfaceStyle::AmbientBlur => (
-            Color32::from_rgba_unmultiplied(16, 17, 21, 188),
-            Some(Color32::from_white_alpha(22)),
-        ),
-        SurfaceStyle::Acrylic => (
-            Color32::from_rgba_unmultiplied(24, 28, 36, 158),
-            Some(Color32::from_white_alpha(38)),
-        ),
+        SurfaceStyle::Acrylic => {
+            let a = (op * 0.68 * 255.0).round().clamp(18.0, 215.0) as u8;
+            (
+                Color32::from_rgba_unmultiplied(18, 20, 24, a),
+                Some(Color32::from_white_alpha(28)),
+            )
+        }
+        SurfaceStyle::Mica | SurfaceStyle::MicaAlt => {
+            let a = (op * 0.62 * 255.0).round().clamp(16.0, 210.0) as u8;
+            (
+                Color32::from_rgba_unmultiplied(16, 18, 22, a),
+                Some(Color32::from_white_alpha(22)),
+            )
+        }
     };
     ui.painter().rect_filled(rect, RADIUS, fill);
     let mut child = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect).layout(Layout::top_down(Align::Min)));
@@ -728,11 +802,22 @@ fn top_bar(app: &mut App, ui: &mut Ui, top: Rect) {
     ui.painter().circle_filled(avatar_outer.center(), 24.0, av_bg);
     let inner_color = if app.data.settings.private_session {
         Color32::from_rgb(0x50, 0x9b, 0xf5)
-    } else {
+    } else if app.data.settings.accent_theme == crate::library::AccentTheme::SpotifyGreen {
         ACCENT_ALT
+    } else {
+        accent_color(app.data.settings.accent_theme)
     };
+    let avatar_initial = app
+        .data
+        .settings
+        .profile_name
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "N".to_string());
     ui.painter().circle_filled(avatar_outer.center(), 16.0, inner_color);
-    text(ui.painter(), avatar_outer.center(), "N", bold(14.0), Color32::BLACK, 24.0, Align2::CENTER_CENTER);
+    text(ui.painter(), avatar_outer.center(), &avatar_initial, bold(14.0), Color32::BLACK, 24.0, Align2::CENTER_CENTER);
     if app.data.settings.private_session {
         ui.painter().circle_filled(avatar_outer.center() + Vec2::new(11.0, 11.0), 4.0, Color32::from_rgb(0x1f, 0x73, 0xe8));
     }
@@ -943,8 +1028,8 @@ fn draw_search_dropdown(app: &mut App, ui: &mut Ui, search_rect: Rect) {
         .fixed_pos(dd_pos)
         .show(ui.ctx(), |ui| {
             popup_frame(ui.style()).show(ui, |ui| {
-                ui.set_width(dd_w - 16.0);
-                ui.set_max_height(460.0);
+                ui.set_width(dd_w - 10.0);
+                ui.set_max_height(360.0);
                 let q = app.search.trim().to_string();
                 if !q.is_empty() {
                     draw_search_dropdown_hints(app, ui);

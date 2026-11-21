@@ -109,6 +109,102 @@ pub fn cover(ui: &Ui, rect: Rect, tex: &TextureHandle, radius: f32) {
         .paint_at(ui, rect);
 }
 
+/// Reusable frosted glass surface matching Spicy Lyrics `NPVLyrics.css` / `default.css` / `tokens.css`.
+/// Render order: dynamic background -> optional GPU frosted backdrop blur -> translucent tint & specular rim -> crisp foreground content.
+#[derive(Clone, Copy)]
+pub struct GlassCard {
+    pub corner_radius: u8,
+    pub inner_margin: egui::Margin,
+    pub tint: Color32,
+    pub border: Color32,
+    pub frost_uv: f32,
+    pub tint_strength: f32,
+}
+
+impl Default for GlassCard {
+    fn default() -> Self {
+        Self {
+            corner_radius: GLASS_CARD_RADIUS_MD,
+            inner_margin: egui::Margin::same(16),
+            tint: GLASS_CARD_FILL,
+            border: GLASS_CARD_BORDER,
+            frost_uv: 0.022,
+            tint_strength: 0.072,
+        }
+    }
+}
+
+impl GlassCard {
+    pub fn lyrics() -> Self {
+        Self {
+            corner_radius: GLASS_CARD_RADIUS_LG,
+            inner_margin: egui::Margin::ZERO,
+            border: Color32::from_white_alpha(14),
+            frost_uv: 0.032, // `NPVLyrics.css:16`: `backdrop-filter: blur(12px)`
+            tint_strength: 0.072,
+            ..Self::default()
+        }
+    }
+
+    pub fn section() -> Self {
+        Self {
+            corner_radius: GLASS_CARD_RADIUS_MD,
+            inner_margin: egui::Margin::same(16),
+            frost_uv: 0.018, // `default.css:388`: `backdrop-filter: blur(6px)`
+            tint_strength: 0.070,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_margin(mut self, margin: egui::Margin) -> Self {
+        self.inner_margin = margin;
+        self
+    }
+
+    pub fn show<R>(&self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+        let backdrop_ctx = ui
+            .ctx()
+            .data(|d| d.get_temp::<super::backdrop::GlassBackdropContext>(egui::Id::NULL.with("npv-glass-backdrop")));
+        // Reserve a painter slot strictly behind the foreground content for the frosted glass layer.
+        let bg_slot = ui.painter().add(Shape::Noop);
+        let rim_slot = ui.painter().add(Shape::Noop);
+
+        let frame_resp = egui::Frame::new()
+            .fill(Color32::TRANSPARENT)
+            .corner_radius(card_radius(self.corner_radius))
+            .inner_margin(self.inner_margin)
+            .show(ui, add_contents);
+
+        let card_rect = frame_resp.response.rect;
+        let radius = card_radius(self.corner_radius);
+        let mut used_gpu = false;
+        if let Some(ref bctx) = backdrop_ctx {
+            if card_rect.is_positive() && card_rect.intersects(ui.clip_rect()) {
+                if let Some(shape) = super::backdrop::glass_shape(
+                    ui,
+                    card_rect,
+                    bctx,
+                    self.corner_radius as f32,
+                    self.frost_uv,
+                    self.tint_strength,
+                ) {
+                    ui.painter().set(bg_slot, shape);
+                    used_gpu = true;
+                }
+            }
+        }
+        if !used_gpu {
+            ui.painter().set(bg_slot, Shape::rect_filled(card_rect, radius, self.tint));
+        }
+        // Subtle 1px translucent glass outline (no harsh straight top-edge segment).
+        ui.painter().set(
+            rim_slot,
+            Shape::rect_stroke(card_rect, radius, Stroke::new(1.0, self.border), egui::StrokeKind::Inside),
+        );
+        frame_resp
+    }
+}
+
 /// Draws a soft downward-offset ambient shadow beneath album/playlist artwork without dark side halos.
 pub fn cover_shadow(p: &Painter, rect: Rect, radius: f32) {
     if rect.width() <= 14.0 || rect.height() <= 14.0 {
@@ -311,9 +407,11 @@ pub fn marquee_text(
             }
             entry.1
         });
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(16));
-        marquee_offset((now - start_t).max(0.0), overflow)
+        let (off, next_wait) = marquee_state((now - start_t).max(0.0), overflow);
+        if !ui.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            ui.ctx().request_repaint_after(next_wait);
+        }
+        off
     } else {
         0.0
     };
@@ -354,9 +452,9 @@ pub fn marquee_text(
         .galley(draw_pos, galley, color);
 }
 
-fn marquee_offset(elapsed_s: f64, overflow: f32) -> f32 {
+fn marquee_state(elapsed_s: f64, overflow: f32) -> (f32, std::time::Duration) {
     if overflow <= 0.0 {
-        return 0.0;
+        return (0.0, std::time::Duration::ZERO);
     }
     const SPEED_PX_S: f64 = 12.0;
     const PAUSE_S: f64 = 1.5;
@@ -365,14 +463,25 @@ fn marquee_offset(elapsed_s: f64, overflow: f32) -> f32 {
     let cycle = half_cycle * 2.0;
     let t = elapsed_s.rem_euclid(cycle);
     if t < PAUSE_S {
-        0.0
+        (0.0, std::time::Duration::from_secs_f64((PAUSE_S - t).clamp(0.033, PAUSE_S)))
     } else if t < half_cycle {
-        ((t - PAUSE_S) * SPEED_PX_S) as f32
+        (((t - PAUSE_S) * SPEED_PX_S) as f32, std::time::Duration::from_millis(33))
     } else if t < half_cycle + PAUSE_S {
-        overflow
+        (
+            overflow,
+            std::time::Duration::from_secs_f64((half_cycle + PAUSE_S - t).clamp(0.033, PAUSE_S)),
+        )
     } else {
-        (overflow as f64 - (t - half_cycle - PAUSE_S) * SPEED_PX_S).max(0.0) as f32
+        (
+            (overflow as f64 - (t - half_cycle - PAUSE_S) * SPEED_PX_S).max(0.0) as f32,
+            std::time::Duration::from_millis(33),
+        )
     }
+}
+
+#[cfg(test)]
+fn marquee_offset(elapsed_s: f64, overflow: f32) -> f32 {
+    marquee_state(elapsed_s, overflow).0
 }
 
 /// Spotify green circular play/pause button with lift-in animation, drop shadow, and 1.04x hover scale.
@@ -534,6 +643,11 @@ mod tests {
         assert_eq!(marquee_offset(4.9, 24.0), 24.0);
         assert!((marquee_offset(6.0, 24.0) - 12.0).abs() < 1e-4);
         assert!((marquee_offset(7.0, 24.0) - 0.0).abs() < 1e-4);
+        // Resting end pauses sleep for the remaining pause instead of waking at 60fps.
+        assert!(marquee_state(0.0, 24.0).1 >= std::time::Duration::from_millis(1400));
+        assert!(marquee_state(3.5, 24.0).1 >= std::time::Duration::from_millis(1400));
+        // Active travel scrolls at ~30fps (33ms).
+        assert_eq!(marquee_state(2.5, 24.0).1, std::time::Duration::from_millis(33));
     }
 }
 

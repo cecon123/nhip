@@ -7,7 +7,7 @@ mod media;
 mod theme;
 mod ui;
 
-use nhip_core::{audio, library, lrc, mechanics, queue, ttml, ytm};
+use nhip_core::{audio, library, lrc, mechanics, queue, spicy, ttml, ytm};
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -37,87 +37,164 @@ fn main() -> eframe::Result<()> {
             .with_inner_size(size)
             .with_min_inner_size([800.0, 600.0])
             .with_decorations(false)
+            .with_transparent(true)
             .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native("Nhịp", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, screenshot, page)))))
 }
 
-/// Modern supersampled squircle Nhịp icon: obsidian glass tile with luminous emerald rhythm bars.
-fn app_icon() -> egui::IconData {
-    const N: usize = 128;
-    let mut rgba = vec![0u8; N * N * 4];
-    let half = N as f32 * 0.5;
+/// Renders the Nhịp "Mèo Sóng Âm" (Waveform Equalizer Cat) Liquid Glass vector emblem as RGBA bytes (`size x size`).
+pub(crate) fn render_nhip_icon_rgba(size: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; size * size * 4];
+    let half = size as f32 * 0.5;
     let inv_half = 1.0 / half;
 
-    let sd_rounded_box = |px: f32, py: f32, bx: f32, by: f32, r: f32| -> f32 {
-        let qx = px.abs() - bx + r;
-        let qy = py.abs() - by + r;
-        qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+    // Continuous G² Apple squircle signed distance approximation (`|x|^p + |y|^p = r^p`, p = 4.6).
+    let sd_squircle = |px: f32, py: f32, r: f32| -> f32 {
+        let p = 4.6_f32;
+        let ax = px.abs().max(1e-6);
+        let ay = py.abs().max(1e-6);
+        (ax.powf(p) + ay.powf(p)).powf(1.0 / p) - r
     };
 
-    // 4-bar rhythmic pulse emblem (`Nhịp` acoustic waveform mark) in normalized [-1, 1] coords.
-    const BARS: [(f32, f32, f32); 4] = [
-        (-0.42, 0.24, 0.085),
-        (-0.14, 0.48, 0.085),
-        (0.14, 0.34, 0.085),
-        (0.42, 0.20, 0.085),
-    ];
+    // Capsule SDF between points A and B with radius r.
+    let sd_capsule = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32, r: f32| -> f32 {
+        let pax = px - ax;
+        let pay = py - ay;
+        let bax = bx - ax;
+        let bay = by - ay;
+        let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay).max(1e-6)).clamp(0.0, 1.0);
+        (pax - bax * h).hypot(pay - bay * h) - r
+    };
 
-    for y in 0..N {
-        for x in 0..N {
+    // Exact 2D triangle SDF for the subtle dark-emerald cat nose on the center equalizer bar.
+    let sd_triangle = |px: f32, py: f32, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32)| -> f32 {
+        let e0 = (p1.0 - p0.0, p1.1 - p0.1);
+        let e1 = (p2.0 - p1.0, p2.1 - p1.1);
+        let e2 = (p0.0 - p2.0, p0.1 - p2.1);
+        let v0 = (px - p0.0, py - p0.1);
+        let v1 = (px - p1.0, py - p1.1);
+        let v2 = (px - p2.0, py - p2.1);
+        let seg = |v: (f32, f32), e: (f32, f32)| -> f32 {
+            let t = ((v.0 * e.0 + v.1 * e.1) / (e.0 * e.0 + e.1 * e.1).max(1e-6)).clamp(0.0, 1.0);
+            let dx = v.0 - e.0 * t;
+            let dy = v.1 - e.1 * t;
+            dx * dx + dy * dy
+        };
+        let d2 = seg(v0, e0).min(seg(v1, e1)).min(seg(v2, e2));
+        let s = (e0.0 * e2.1 - e0.1 * e2.0).signum();
+        let c0 = s * (v0.0 * e0.1 - v0.1 * e0.0);
+        let c1 = s * (v1.0 * e1.1 - v1.1 * e1.0);
+        let c2 = s * (v2.0 * e2.1 - v2.1 * e2.0);
+        let inside = c0.min(c1).min(c2) >= 0.0;
+        if inside { -d2.sqrt() } else { d2.sqrt() }
+    };
+
+    // Waveform Equalizer Cat ("Mèo Sóng Âm"): 7 symmetric equalizer pill bars sculpting a geometric
+    // cat head with tall pointed ears and negative-space eye cutouts, flanked by 2 subtle whisker pulses.
+    let sd_main_bars = |px: f32, py: f32| -> f32 {
+        let ax = px.abs();
+        let r = 0.0625_f32;
+        // Outer cheek bars (±0.508)
+        let cheek = sd_capsule(ax, py, 0.508, -0.109, 0.508, 0.344, r);
+        // Tall cat ear peak bars (±0.336)
+        let ear = sd_capsule(ax, py, 0.336, -0.453, 0.336, 0.422, r);
+        // Eye-split bars (±0.164): negative-space gap between y=-0.0625 and y=0.250 forms cute cat eyes
+        let eye_top = sd_capsule(ax, py, 0.164, -0.1875, 0.164, -0.0625, r);
+        let eye_bot = sd_capsule(ax, py, 0.164, 0.250, 0.164, 0.469, r);
+        // Center crown & chin bar (0.0)
+        let center = sd_capsule(ax, py, 0.0, -0.125, 0.0, 0.484, r);
+        cheek.min(ear).min(eye_top).min(eye_bot).min(center)
+    };
+    let sd_whisker_bars = |px: f32, py: f32| -> f32 {
+        sd_capsule(px.abs(), py, 0.684, 0.098, 0.684, 0.215, 0.0508)
+    };
+    let sd_emblem = |px: f32, py: f32| -> f32 {
+        sd_main_bars(px, py).min(sd_whisker_bars(px, py))
+    };
+    let sd_nose = |px: f32, py: f32| -> f32 {
+        sd_triangle(px, py, (-0.045, 0.236), (0.045, 0.236), (0.0, 0.292)) - 0.012
+    };
+
+    let samples = if size >= 128 { 3 } else { 4 };
+    let inv_samples = 1.0 / samples as f32;
+    let aa_px = 1.6 * inv_half;
+
+    for y in 0..size {
+        for x in 0..size {
             let mut acc = [0.0f32; 4];
-            for sy in 0..2 {
-                for sx in 0..2 {
-                    let px = ((x as f32 + (sx as f32 + 0.5) * 0.5) - half) * inv_half;
-                    let py = ((y as f32 + (sy as f32 + 0.5) * 0.5) - half) * inv_half;
-                    let d_tile = sd_rounded_box(px, py, 0.92, 0.92, 0.30);
-                    if d_tile > 0.02 {
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let px = ((x as f32 + (sx as f32 + 0.5) * inv_samples) - half) * inv_half;
+                    let py = ((y as f32 + (sy as f32 + 0.5) * inv_samples) - half) * inv_half;
+
+                    let d_tile = sd_squircle(px, py, 0.93);
+                    if d_tile > aa_px {
                         continue;
                     }
-                    let tile_a = ((-d_tile) / 0.022).clamp(0.0, 1.0);
+                    let tile_a = ((-d_tile) / aa_px + 0.5).clamp(0.0, 1.0);
 
-                    // Deep obsidian glass base with diagonal ambient emerald sheen.
-                    let grad_t = ((px * 0.45 - py * 0.55) + 0.5).clamp(0.0, 1.0);
-                    let mut r = 11.0 + 10.0 * grad_t;
-                    let mut g = 18.0 + 28.0 * grad_t;
-                    let mut b = 15.0 + 18.0 * grad_t;
+                    // Liquid Glass emerald-to-teal jewel gradient (`#20EC7E -> #0EB368 -> #05644C`).
+                    let vy = ((py + 0.93) / 1.86).clamp(0.0, 1.0);
+                    let vx = ((px + 0.93) / 1.86).clamp(0.0, 1.0);
+                    let mut r = 32.0 * (1.0 - vy) + 5.0 * vy + 8.0 * (1.0 - vx) * (1.0 - vy);
+                    let mut g = 236.0 * (1.0 - vy) + 100.0 * vy + 16.0 * (1.0 - vx) * (1.0 - vy);
+                    let mut b = 126.0 * (1.0 - vy) + 76.0 * vy + 18.0 * vx * vy;
 
-                    // Soft radial emerald aura behind the central waveform bars.
-                    let radial = (1.0 - (px * px * 1.1 + (py + 0.05).powi(2) * 1.1).sqrt()).clamp(0.0, 1.0);
-                    let aura = radial * radial * 0.55;
-                    r += 16.0 * aura;
-                    g += 132.0 * aura;
-                    b += 58.0 * aura;
+                    // Overhead Liquid Glass dome sheen (soft curved top reflection).
+                    let dome_d = ((px * 0.85).powi(2) + ((py + 0.72) * 1.35).powi(2)).sqrt();
+                    let dome = (1.0 - dome_d).clamp(0.0, 1.0).powf(2.2) * 0.30;
+                    r += (255.0 - r) * dome;
+                    g += (255.0 - g) * dome;
+                    b += (255.0 - b) * dome;
 
-                    // Specular frosted rim highlight along top-left edge.
-                    let rim = (1.0 - (d_tile + 0.025).abs() / 0.025).clamp(0.0, 1.0);
-                    let rim_light = ((-py * 0.65 - px * 0.35) * 0.5 + 0.5).clamp(0.0, 1.0);
-                    let rim_add = rim * (14.0 + 46.0 * rim_light);
-                    r += rim_add;
-                    g += rim_add * 1.25;
-                    b += rim_add * 1.05;
+                    // Subtle bottom-right inner emerald bounce light (Liquid Glass caustics).
+                    let bounce_d = ((px - 0.38).hypot(py - 0.48) / 0.82).clamp(0.0, 1.0);
+                    let bounce = (1.0 - bounce_d).powf(2.0) * 0.22;
+                    r += 26.0 * bounce;
+                    g += 116.0 * bounce;
+                    b += 82.0 * bounce;
 
-                    // Luminous rounded-capsule rhythm bars + soft bloom.
-                    let mut min_bar = 10.0f32;
-                    for &(bx, bh, bw) in &BARS {
-                        let db = sd_rounded_box(px - bx, py, bw, bh, bw);
-                        min_bar = min_bar.min(db);
+                    // Crisp Liquid Glass outer refractive rim (brightest top-left & bottom-right).
+                    let edge_band = (1.0 - (d_tile + 0.026).abs() / 0.026).clamp(0.0, 1.0);
+                    let rim_dir = ((-px - py) * 0.55).max((px + py) * 0.38).clamp(0.0, 1.0);
+                    let rim = edge_band * (0.16 + 0.56 * rim_dir);
+                    r += (255.0 - r) * rim;
+                    g += (255.0 - g) * rim;
+                    b += (255.0 - b) * rim;
+
+                    // Soft vertical drop shadow under the white equalizer cat emblem.
+                    let d_shadow = sd_emblem(px, py - 0.048);
+                    if d_shadow < 0.16 {
+                        let sh = ((-d_shadow.max(0.0) * 15.0).exp() * 0.26).clamp(0.0, 0.30);
+                        r *= 1.0 - sh;
+                        g *= 1.0 - sh;
+                        b *= 1.0 - sh;
                     }
-                    let glow = (-min_bar.max(0.0) * 6.5).exp() * 0.45;
-                    r += 28.0 * glow;
-                    g += 205.0 * glow;
-                    b += 92.0 * glow;
 
-                    let bar_cov = ((-min_bar) / 0.018).clamp(0.0, 1.0);
-                    if bar_cov > 0.0 {
-                        let bar_v = ((0.5 - py) * 0.9).clamp(0.0, 1.0);
-                        let br = 30.0 + 112.0 * bar_v;
-                        let bg = 215.0 + 38.0 * bar_v;
-                        let bb = 96.0 + 96.0 * bar_v;
-                        r = r * (1.0 - bar_cov) + br * bar_cov;
-                        g = g * (1.0 - bar_cov) + bg * bar_cov;
-                        b = b * (1.0 - bar_cov) + bb * bar_cov;
+                    // Pure frosted-white equalizer cat bars + slightly softer outer whisker pulses.
+                    let d_main = sd_main_bars(px, py);
+                    let d_whisker = sd_whisker_bars(px, py);
+                    let main_cov = ((-d_main) / aa_px + 0.5).clamp(0.0, 1.0);
+                    let whisker_cov = ((-d_whisker) / aa_px + 0.5).clamp(0.0, 1.0) * 0.84;
+                    let mark_cov = main_cov.max(whisker_cov);
+                    if mark_cov > 0.0 {
+                        let shine = ((0.45 - py) * 0.55).clamp(0.0, 1.0);
+                        let mr = 238.0 + 17.0 * shine;
+                        let mg = 250.0 + 5.0 * shine;
+                        let mb = 244.0 + 11.0 * shine;
+                        r = r * (1.0 - mark_cov) + mr * mark_cov;
+                        g = g * (1.0 - mark_cov) + mg * mark_cov;
+                        b = b * (1.0 - mark_cov) + mb * mark_cov;
+                    }
+
+                    // Crisp dark-emerald cat nose accent centered on middle bar.
+                    let nose_cov = ((-sd_nose(px, py)) / aa_px + 0.5).clamp(0.0, 1.0);
+                    if nose_cov > 0.0 {
+                        r = r * (1.0 - nose_cov) + 6.0 * nose_cov;
+                        g = g * (1.0 - nose_cov) + 107.0 * nose_cov;
+                        b = b * (1.0 - nose_cov) + 70.0 * nose_cov;
                     }
 
                     acc[0] += r * tile_a;
@@ -126,8 +203,9 @@ fn app_icon() -> egui::IconData {
                     acc[3] += tile_a;
                 }
             }
-            let a = (acc[3] * 0.25).clamp(0.0, 1.0);
-            let i = (y * N + x) * 4;
+            let total_s = (samples * samples) as f32;
+            let a = (acc[3] / total_s).clamp(0.0, 1.0);
+            let i = (y * size + x) * 4;
             if a > 1e-4 {
                 let inv = 1.0 / acc[3];
                 rgba[i] = (acc[0] * inv).round().clamp(0.0, 255.0) as u8;
@@ -137,5 +215,48 @@ fn app_icon() -> egui::IconData {
             }
         }
     }
-    egui::IconData { rgba, width: N as u32, height: N as u32 }
+    rgba
+}
+
+fn app_icon() -> egui::IconData {
+    const N: usize = 256;
+    egui::IconData {
+        rgba: render_nhip_icon_rgba(N),
+        width: N as u32,
+        height: N as u32,
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::render_nhip_icon_rgba;
+
+    #[test]
+    fn waveform_cat_icon_renders_symmetric_ears_eye_cutouts_and_nose() {
+        let n = 64usize;
+        let rgba = render_nhip_icon_rgba(n);
+        let px = |u: f32, v: f32| -> [u8; 4] {
+            let x = (((u + 1.0) * 0.5) * n as f32).clamp(0.0, (n - 1) as f32) as usize;
+            let y = (((v + 1.0) * 0.5) * n as f32).clamp(0.0, (n - 1) as f32) as usize;
+            let i = (y * n + x) * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        // Corner outside squircle is transparent.
+        assert_eq!(rgba[3], 0);
+        // Both tall cat ear peaks (±0.336, -0.35) are crisp bright white.
+        let ear_l = px(-0.336, -0.35);
+        let ear_r = px(0.336, -0.35);
+        assert!(ear_l[0] > 220 && ear_l[1] > 235 && ear_l[2] > 225, "left ear={ear_l:?}");
+        assert!(ear_r[0] > 220 && ear_r[1] > 235 && ear_r[2] > 225, "right ear={ear_r:?}");
+        // Eye cutouts (±0.164, 0.08) show emerald background (low red, dominant green) instead of white bar.
+        let eye_l = px(-0.164, 0.08);
+        let eye_r = px(0.164, 0.08);
+        assert!(eye_l[0] < 90 && eye_l[1] >= 125 && eye_l[1] > eye_l[0] * 3, "left eye cutout={eye_l:?}");
+        assert!(eye_r[0] < 90 && eye_r[1] >= 125 && eye_r[1] > eye_r[0] * 3, "right eye cutout={eye_r:?}");
+        // Cat nose at center bar (0.0, 0.26) is deep emerald accent (distinct from surrounding white bar).
+        let nose = px(0.0, 0.26);
+        let forehead = px(0.0, 0.0);
+        assert!(forehead[0] > 220, "center bar={forehead:?}");
+        assert!(nose[0] < 60 && nose[1] < 140, "nose accent={nose:?}");
+    }
 }

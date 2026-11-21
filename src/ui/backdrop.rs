@@ -9,29 +9,129 @@ use eframe::glow::{self, HasContext};
 
 type Slot = Arc<Mutex<Option<Result<Renderer, String>>>>;
 
+/// Shared sidebar backdrop context stored per-frame so `GlassCard` surfaces can sample
+/// pixel-aligned GPU backdrop blur directly from the dynamic Kawarp background.
+#[derive(Clone)]
+pub struct GlassBackdropContext {
+    pub panel_rect: Rect,
+    pub texture: TextureHandle,
+    pub phase: f32,
+    pub sidebar: bool,
+}
+
 /// Paint a raw, blurred cover with Kawarp's phase in accumulated animation seconds.
 /// `sidebar` selects the NPv CSS filter; `alpha` is the layer's crossfade opacity.
 pub fn paint(ui: &egui::Ui, rect: Rect, tex: &TextureHandle, phase: f32, alpha: f32, sidebar: bool, header_fade: Option<f32>) {
-    if !rect.is_positive() || !rect.intersects(ui.clip_rect()) || alpha <= 0.0 {
-        return;
+    paint_impl(ui, rect, rect, tex, phase, alpha, sidebar, header_fade, None, 0.0, 0.0);
+}
+
+/// Builds a `Shape::Callback` for a frosted glass backdrop blur strictly inside `card_rect`,
+/// seamlessly aligned to `panel_rect` so callers can insert it into a reserved background painter slot.
+pub fn glass_shape(
+    ui: &egui::Ui,
+    card_rect: Rect,
+    ctx: &GlassBackdropContext,
+    radius_pt: f32,
+    frost_uv: f32,
+    tint: f32,
+) -> Option<egui::Shape> {
+    build_shape(
+        ui,
+        card_rect,
+        ctx.panel_rect,
+        &ctx.texture,
+        ctx.phase,
+        1.0,
+        ctx.sidebar,
+        None,
+        Some(radius_pt),
+        frost_uv,
+        tint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_impl(
+    ui: &egui::Ui,
+    rect: Rect,
+    panel_rect: Rect,
+    tex: &TextureHandle,
+    phase: f32,
+    alpha: f32,
+    sidebar: bool,
+    header_fade: Option<f32>,
+    radius_override_pt: Option<f32>,
+    frost_uv: f32,
+    tint: f32,
+) -> bool {
+    if let Some(shape) = build_shape(
+        ui,
+        rect,
+        panel_rect,
+        tex,
+        phase,
+        alpha,
+        sidebar,
+        header_fade,
+        radius_override_pt,
+        frost_uv,
+        tint,
+    ) {
+        ui.painter().add(shape);
+        true
+    } else {
+        if frost_uv <= 0.0001 && rect.is_positive() && rect.intersects(ui.clip_rect()) && alpha > 0.0 {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8),
+            );
+        }
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_shape(
+    ui: &egui::Ui,
+    rect: Rect,
+    panel_rect: Rect,
+    tex: &TextureHandle,
+    phase: f32,
+    alpha: f32,
+    sidebar: bool,
+    header_fade: Option<f32>,
+    radius_override_pt: Option<f32>,
+    frost_uv: f32,
+    tint: f32,
+) -> Option<egui::Shape> {
+    if !rect.is_positive() || !panel_rect.is_positive() || !rect.intersects(ui.clip_rect()) || alpha <= 0.0 {
+        return None;
     }
     let vp_id = ui.ctx().viewport_id();
     let slot: Slot = ui.ctx().data_mut(|data| {
         data.get_temp_mut_or_insert_with(egui::Id::NULL.with(("kawarp-gpu", vp_id)), Slot::default).clone()
     });
     if slot.lock().is_ok_and(|state| matches!(&*state, Some(Err(_)))) {
-        // shortcut: failed GL initialization uses the raw cover; retry when the renderer is recreated.
-        ui.painter().image(tex.id(), rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8));
-        return;
+        return None;
     }
+    let pw = panel_rect.width().max(1.0);
+    let ph = panel_rect.height().max(1.0);
+    let uv_rect = [
+        (rect.left() - panel_rect.left()) / pw,
+        1.0 - (rect.bottom() - panel_rect.top()) / ph,
+        rect.width() / pw,
+        rect.height() / ph,
+    ];
     let tex = tex.clone();
-    ui.painter().add(egui::PaintCallback {
+    Some(egui::Shape::Callback(egui::PaintCallback {
         rect,
         callback: Arc::new(CallbackFn::new(move |info, painter| {
             let Some(texture) = painter.texture(tex.id()) else { return };
             let Ok(mut state) = slot.lock() else { return };
             let gl = painter.gl();
-            // SAFETY: egui invokes this callback on the thread with this GL context current.
+            // SAFETY: egui invokes this paint callback on the thread with this GL context current.
             unsafe {
                 collect_retired(gl);
                 let saved = GlState::save(gl);
@@ -43,8 +143,26 @@ pub fn paint(ui: &egui::Ui, rect: Rect, tex: &TextureHandle, phase: f32, alpha: 
                 });
                 if let Ok(renderer) = renderer {
                     let viewport = info.viewport_in_pixels();
-                    let radius = if rect.left() > 0.0 && rect.top() > 0.0 { 8.0 * viewport.width_px as f32 / rect.width() } else { 0.0 };
-                    if let Err(error) = renderer.draw(painter, texture, [viewport.width_px, viewport.height_px], phase, alpha.clamp(0.0, 1.0), sidebar, header_fade.map(|h| [(h-16.0)/rect.height(), (h+32.0)/rect.height()]), radius, &saved) {
+                    let ppp = viewport.width_px as f32 / rect.width().max(1.0);
+                    let radius = match radius_override_pt {
+                        Some(r) => r * ppp,
+                        None if rect.left() > 0.0 && rect.top() > 0.0 => 8.0 * ppp,
+                        None => 0.0,
+                    };
+                    if let Err(error) = renderer.draw(
+                        painter,
+                        texture,
+                        [viewport.width_px, viewport.height_px],
+                        phase,
+                        alpha.clamp(0.0, 1.0),
+                        sidebar,
+                        header_fade.map(|h| [(h - 16.0) / rect.height(), (h + 32.0) / rect.height()]),
+                        radius,
+                        uv_rect,
+                        frost_uv,
+                        tint,
+                        &saved,
+                    ) {
                         eprintln!("Kawarp GPU backdrop: {error}");
                         *state = Some(Err(error));
                     }
@@ -52,15 +170,17 @@ pub fn paint(ui: &egui::Ui, rect: Rect, tex: &TextureHandle, phase: f32, alpha: 
                 saved.restore(gl);
             }
         })),
-    });
+    }))
 }
+
+type TargetSlot = (glow::Texture, glow::Framebuffer, [i32; 2], u64);
 
 struct Renderer {
     gl: Weak<glow::Context>,
     warp: glow::Program,
     output: glow::Program,
     vao: glow::VertexArray,
-    targets: [Option<(glow::Texture, glow::Framebuffer, [i32; 2], u64)>; 4],
+    targets: [Option<TargetSlot>; 4],
     tick: u64,
 }
 
@@ -128,7 +248,22 @@ impl Renderer {
         }
     }
 
-    unsafe fn draw(&mut self, painter: &Painter, source: glow::Texture, size: [i32; 2], phase: f32, alpha: f32, sidebar: bool, header_fade: Option<[f32; 2]>, radius: f32, saved: &GlState) -> Result<(), String> {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw(
+        &mut self,
+        painter: &Painter,
+        source: glow::Texture,
+        size: [i32; 2],
+        phase: f32,
+        alpha: f32,
+        sidebar: bool,
+        header_fade: Option<[f32; 2]>,
+        radius: f32,
+        uv_rect: [f32; 4],
+        frost_uv: f32,
+        tint: f32,
+        saved: &GlState,
+    ) -> Result<(), String> {
         let gl = painter.gl();
         if size[0] <= 0 || size[1] <= 0 { return Ok(()); }
         // SAFETY: all handles belong to the callback's current context; the outer callback restores state on errors too.
@@ -136,7 +271,10 @@ impl Renderer {
             gl.active_texture(glow::TEXTURE0);
             self.tick = self.tick.wrapping_add(1);
             let tick = self.tick;
-            let slot_idx = if let Some(idx) = self.targets.iter().position(|t| t.as_ref().is_some_and(|e| e.2 == size)) {
+            // For frosted glass cards, render the low-frequency warp pass at a compact fixed resolution
+            // (256x256) so all GlassCards share ONE cached FBO slot with zero FBO churn on resize/scroll.
+            let warp_size = if frost_uv > 0.0001 { [256, 256] } else { size };
+            let slot_idx = if let Some(idx) = self.targets.iter().position(|t| t.as_ref().is_some_and(|e| e.2 == warp_size)) {
                 idx
             } else if let Some(idx) = self.targets.iter().position(|t| t.is_none()) {
                 idx
@@ -149,7 +287,7 @@ impl Renderer {
                     .unwrap_or(0)
             };
             let target = &mut self.targets[slot_idx];
-            if target.as_ref().is_none_or(|target| target.2 != size) {
+            if target.as_ref().is_none_or(|target| target.2 != warp_size) {
                 let texture = gl.create_texture()?;
                 let framebuffer = match gl.create_framebuffer() {
                     Ok(framebuffer) => framebuffer,
@@ -160,7 +298,7 @@ impl Renderer {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
                 gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
                 gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA16F as i32, size[0], size[1], 0, glow::RGBA, glow::HALF_FLOAT, glow::PixelUnpackData::Slice(None));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA16F as i32, warp_size[0], warp_size[1], 0, glow::RGBA, glow::HALF_FLOAT, glow::PixelUnpackData::Slice(None));
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
                 gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
                 if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
@@ -168,7 +306,7 @@ impl Renderer {
                     gl.delete_texture(texture);
                     return Err("RGBA16F warp framebuffer is incomplete".into());
                 }
-                if let Some((old_texture, old_framebuffer, _, _)) = target.replace((texture, framebuffer, size, tick)) {
+                if let Some((old_texture, old_framebuffer, _, _)) = target.replace((texture, framebuffer, warp_size, tick)) {
                     gl.delete_framebuffer(old_framebuffer);
                     gl.delete_texture(old_texture);
                 }
@@ -180,7 +318,7 @@ impl Renderer {
             gl.disable(glow::SCISSOR_TEST);
             gl.disable(glow::BLEND);
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-            gl.viewport(0, 0, size[0], size[1]);
+            gl.viewport(0, 0, warp_size[0], warp_size[1]);
             gl.use_program(Some(self.warp));
             gl.bind_texture(glow::TEXTURE_2D, Some(source));
             gl.uniform_1_i32(gl.get_uniform_location(self.warp, "u_texture").as_ref(), 0);
@@ -195,9 +333,25 @@ impl Renderer {
             gl.use_program(Some(self.output));
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             gl.uniform_1_i32(gl.get_uniform_location(self.output, "u_texture").as_ref(), 0);
-            for (name, value) in [("u_time", phase), ("u_saturation", 1.5), ("u_dithering", 0.008), ("u_scale", 1.0), ("u_alpha", alpha), ("u_sidebar", if sidebar { 1.0 } else { 0.0 })] {
+            for (name, value) in [
+                ("u_time", phase),
+                ("u_saturation", 1.5),
+                ("u_dithering", 0.008),
+                ("u_scale", 1.0),
+                ("u_alpha", alpha),
+                ("u_sidebar", if sidebar { 1.0 } else { 0.0 }),
+                ("u_frost", frost_uv),
+                ("u_tint", tint),
+            ] {
                 gl.uniform_1_f32(gl.get_uniform_location(self.output, name).as_ref(), value);
             }
+            gl.uniform_4_f32(
+                gl.get_uniform_location(self.output, "u_uv_rect").as_ref(),
+                uv_rect[0],
+                uv_rect[1],
+                uv_rect[2],
+                uv_rect[3],
+            );
             let fade = header_fade.unwrap_or([-2.0, -1.0]);
             gl.uniform_1_f32(gl.get_uniform_location(self.output, "u_radius").as_ref(), radius);
             gl.uniform_2_f32(gl.get_uniform_location(self.output, "u_header_fade").as_ref(), fade[0], fade[1]);

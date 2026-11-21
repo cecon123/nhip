@@ -4,5 +4,6 @@ pub mod lrc;
 pub mod lrclib;
 pub mod mechanics;
 pub mod queue;
+pub mod spicy;
 pub mod ttml;
 pub mod ytm;
