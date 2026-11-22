@@ -1,13 +1,82 @@
 //! Lyrics from LRCLIB (lrclib.net), a free and open lyrics database with timed lines. Lyrics are
 //! fetched when a song is shown and kept only in memory.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::time::Duration;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::Value;
 
 const BASE: &str = "https://lrclib.net/api";
+
+/// Shared keep-alive HTTP client for LRCLIB and LyricsPlus so every track reuses TLS sessions
+/// instead of burning 200-600ms per query on fresh TCP/TLS handshakes.
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_millis(3_000))
+            .tcp_nodelay(true)
+            .build()
+            .expect("lyrics HTTP client")
+    })
+}
+
+enum FetchOutcome {
+    Ok(Value),
+    NotFound,
+    Backoff,
+}
+
+fn get_with_status(agent: &reqwest::blocking::Client, url: &str) -> FetchOutcome {
+    let resp = match agent
+        .get(url)
+        .header("User-Agent", "Nhip/0.1 (desktop music player)")
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return FetchOutcome::Backoff,
+    };
+    let code = resp.status().as_u16();
+    if code == 404 {
+        return FetchOutcome::NotFound;
+    }
+    if code == 429 || code >= 500 {
+        return FetchOutcome::Backoff;
+    }
+    if code != 200 {
+        return FetchOutcome::NotFound;
+    }
+    let mut text = String::new();
+    if resp.take(256_000).read_to_string(&mut text).is_err() {
+        return FetchOutcome::Backoff;
+    }
+    serde_json::from_str(&text)
+        .map(FetchOutcome::Ok)
+        .unwrap_or(FetchOutcome::NotFound)
+}
+
+fn lyricsplus_cooldowns() -> &'static Mutex<HashMap<&'static str, Instant>> {
+    static MAP: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    MAP.get_or_init(Mutex::default)
+}
+
+fn mirror_in_cooldown(base: &'static str) -> bool {
+    lyricsplus_cooldowns()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(base).copied())
+        .is_some_and(|until| Instant::now() < until)
+}
+
+fn mark_mirror_cooldown(base: &'static str, secs: u64) {
+    if let Ok(mut m) = lyricsplus_cooldowns().lock() {
+        m.insert(base, Instant::now() + Duration::from_secs(secs));
+    }
+}
 
 fn enc(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
@@ -23,17 +92,10 @@ fn pick(v: &Value) -> Option<&str> {
 }
 
 fn get(agent: &reqwest::blocking::Client, url: &str) -> Option<Value> {
-    let resp = agent
-        .get(url)
-        .header("User-Agent", "Nhip/0.1 (desktop music player)")
-        .send()
-        .ok()?;
-    if resp.status().as_u16() != 200 {
-        return None;
+    match get_with_status(agent, url) {
+        FetchOutcome::Ok(v) => Some(v),
+        FetchOutcome::NotFound | FetchOutcome::Backoff => None,
     }
-    let mut text = String::new();
-    resp.take(256_000).read_to_string(&mut text).ok()?;
-    serde_json::from_str(&text).ok()
 }
 
 fn matches_recording(v: &Value, title: &str, artist: &str, album: &str, seconds: f64) -> bool {
@@ -86,10 +148,7 @@ pub fn fetch(title: &str, artist: &str, album: &str, duration_ms: u64) -> Option
     if duration_ms == 0 {
         return None;
     }
-    let agent = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
+    let agent = http_client();
     let secs = duration_ms as f64 / 1000.0;
     let mut exact = format!(
         "{BASE}/get?track_name={}&artist_name={}&duration={secs:.0}",
@@ -99,18 +158,44 @@ pub fn fetch(title: &str, artist: &str, album: &str, duration_ms: u64) -> Option
     if !album.trim().is_empty() {
         exact.push_str(&format!("&album_name={}", enc(album)));
     }
-    let found = get(&agent, &exact).filter(|v| matches_recording(v, title, artist, album, secs));
-    if let Some(synced) = found.as_ref().and_then(|v| text(v, "syncedLyrics")) {
-        return Some(synced.to_owned());
-    }
-    let fallback = found.as_ref().and_then(pick).map(str::to_owned);
     let search = format!(
         "{BASE}/search?track_name={}&artist_name={}",
         enc(title),
         enc(artist)
     );
-    let result = get(&agent, &search);
-    let candidates: Vec<_> = result
+    // Race exact `/api/get` and `/api/search` in parallel (1 RTT instead of 2-3 sequential RTTs!)
+    // so tracks without exact album match or with slightly off durations return immediately.
+    let (tx, rx) = mpsc::channel::<(bool, Option<Value>)>();
+    let tx_get = tx.clone();
+    let exact_url = exact;
+    let _ = std::thread::Builder::new().name("lrclib-get".into()).spawn(move || {
+        let _ = tx_get.send((true, get(http_client(), &exact_url)));
+    });
+    let search_url = search;
+    let _ = std::thread::Builder::new().name("lrclib-search".into()).spawn(move || {
+        let _ = tx.send((false, get(http_client(), &search_url)));
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(3_200);
+    let mut found_exact: Option<Value> = None;
+    let mut result_search: Option<Value> = None;
+    for _ in 0..2 {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let Ok((is_exact, val)) = rx.recv_timeout(rem) else { break };
+        if is_exact {
+            found_exact = val.filter(|v| matches_recording(v, title, artist, album, secs));
+            if let Some(synced) = found_exact.as_ref().and_then(|v| text(v, "syncedLyrics")) {
+                return Some(synced.to_owned());
+            }
+        } else {
+            result_search = val;
+        }
+    }
+    let fallback = found_exact.as_ref().and_then(pick).map(str::to_owned);
+    let candidates: Vec<_> = result_search
         .as_ref()
         .and_then(Value::as_array)
         .into_iter()
@@ -127,15 +212,17 @@ pub fn fetch(title: &str, artist: &str, album: &str, duration_ms: u64) -> Option
         .into_iter()
         .next()
         .unwrap_or_else(|| artist.trim().to_owned());
-    let relaxed_query = if clean_title != title.trim() || primary_artist != artist.trim() {
+    let relaxed_query = if (clean_title != title.trim() || primary_artist != artist.trim())
+        && result_search.as_ref().and_then(Value::as_array).is_none_or(|a| a.is_empty())
+    {
         let url = format!(
             "{BASE}/search?track_name={}&artist_name={}",
             enc(&clean_title),
             enc(&primary_artist)
         );
-        get(&agent, &url)
+        get(agent, &url)
     } else {
-        result.clone()
+        result_search.clone()
     };
     let relaxed_candidates: Vec<_> = relaxed_query
         .as_ref()
@@ -415,6 +502,8 @@ pub fn parse_lyricsplus_json(v: &Value) -> Option<crate::lrc::Lyrics> {
 }
 
 /// Fetches word-by-word / syllable-synced lyrics from open public LyricsPlus v2 aggregators (zero auth).
+/// Races healthy mirrors in parallel (1 RTT) and backs off rate-limited/failing hosts for 60s so
+/// dead or 429 mirrors never stall lyrics loading for 8-12 seconds.
 pub fn fetch_word_synced(title: &str, artist: &str, album: &str, duration_ms: u64) -> Option<crate::lrc::Lyrics> {
     let clean_title = strip_title_suffix(title);
     let full_artist = artist.trim();
@@ -425,10 +514,15 @@ pub fn fetch_word_synced(title: &str, artist: &str, album: &str, duration_ms: u6
     if clean_title.is_empty() || primary_artist.is_empty() {
         return None;
     }
-    let agent = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()
-        .ok()?;
+    let active_bases: Vec<&'static str> = LYRICSPLUS_BASES
+        .iter()
+        .copied()
+        .filter(|b| !mirror_in_cooldown(b))
+        .collect();
+    if active_bases.is_empty() {
+        return None;
+    }
+
     let dur_param = if duration_ms >= 30_000 {
         format!("&duration={}", (duration_ms as f64 / 1000.0).round() as u64)
     } else {
@@ -439,32 +533,84 @@ pub fn fetch_word_synced(title: &str, artist: &str, album: &str, duration_ms: u6
     } else {
         String::new()
     };
-    // Include duration hint upfront so LyricsPlus matches the right recording when multiple artists share a title.
-    let mut queries = Vec::with_capacity(3);
-    queries.push(format!("/v2/lyrics/get?title={}&artist={}{album_param}{dur_param}", enc(&clean_title), enc(full_artist)));
-    if primary_artist != full_artist {
-        queries.push(format!("/v2/lyrics/get?title={}&artist={}{album_param}{dur_param}", enc(&clean_title), enc(&primary_artist)));
-    }
-    if !dur_param.is_empty() {
-        queries.push(format!("/v2/lyrics/get?title={}&artist={}", enc(&clean_title), enc(full_artist)));
-    }
-    let mut best_line_only: Option<crate::lrc::Lyrics> = None;
-    for base in LYRICSPLUS_BASES {
-        for q in &queries {
-            let url = format!("{base}{q}");
-            if let Some(json) = get(&agent, &url) {
-                if let Some(parsed) = parse_lyricsplus_json(&json) {
-                    if !lyricsplus_matches_duration(&json, &parsed, duration_ms) {
-                        continue;
+    // Primary query uses primary artist + duration hint (highest hit rate in 1 RTT).
+    let primary_q = format!(
+        "/v2/lyrics/get?title={}&artist={}{album_param}{dur_param}",
+        enc(&clean_title),
+        enc(&primary_artist)
+    );
+    let fallback_q = if !album_param.is_empty() || !dur_param.is_empty() {
+        Some(format!(
+            "/v2/lyrics/get?title={}&artist={}",
+            enc(&clean_title),
+            enc(&primary_artist)
+        ))
+    } else {
+        None
+    };
+
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel::<(&'static str, Option<(crate::lrc::Lyrics, bool)>)>();
+    let total = active_bases.len();
+    for &base in &active_bases {
+        let tx = tx.clone();
+        let q1 = primary_q.clone();
+        let q2 = fallback_q.clone();
+        let _ = std::thread::Builder::new().name("lyricsplus-mirror".into()).spawn(move || {
+            let agent = http_client();
+            let try_query = |q: &str| -> Result<Option<(crate::lrc::Lyrics, bool)>, ()> {
+                match get_with_status(agent, &format!("{base}{q}")) {
+                    FetchOutcome::Ok(json) => {
+                        if let Some(parsed) = parse_lyricsplus_json(&json) {
+                            if lyricsplus_matches_duration(&json, &parsed, duration_ms) {
+                                let has_words = parsed.lines.iter().any(|l| !l.spans.is_empty());
+                                return Ok(Some((parsed, has_words)));
+                            }
+                        }
+                        Ok(None)
                     }
-                    let has_words = parsed.lines.iter().any(|l| !l.spans.is_empty());
-                    if has_words {
-                        return Some(parsed);
-                    }
-                    if best_line_only.is_none() {
-                        best_line_only = Some(parsed);
+                    FetchOutcome::NotFound => Ok(None),
+                    FetchOutcome::Backoff => {
+                        mark_mirror_cooldown(base, 60);
+                        Err(())
                     }
                 }
+            };
+            let mut best: Option<(crate::lrc::Lyrics, bool)> = None;
+            if let Ok(hit) = try_query(&q1) {
+                if hit.as_ref().is_some_and(|(_, has_words)| *has_words) {
+                    let _ = tx.send((base, hit));
+                    return;
+                }
+                best = hit;
+                // Only send a stripped fallback query if the mirror replied quickly (< 1.5s) and stayed healthy.
+                if let Some(q2) = q2.filter(|_| started.elapsed() < Duration::from_millis(1_500)) {
+                    if let Ok(Some((l, has_words))) = try_query(&q2) {
+                        if has_words || best.is_none() {
+                            best = Some((l, has_words));
+                        }
+                    }
+                }
+            }
+            let _ = tx.send((base, best));
+        });
+    }
+    drop(tx);
+
+    let deadline = started + Duration::from_millis(2_800);
+    let mut best_line_only: Option<crate::lrc::Lyrics> = None;
+    for _ in 0..total {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let Ok((_, res)) = rx.recv_timeout(rem) else { break };
+        if let Some((lyrics, has_words)) = res {
+            if has_words {
+                return Some(lyrics);
+            }
+            if best_line_only.is_none() {
+                best_line_only = Some(lyrics);
             }
         }
     }

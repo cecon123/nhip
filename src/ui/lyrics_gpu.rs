@@ -237,10 +237,12 @@ pub fn paint_line(
                 });
                 if let Ok(renderer) = renderer {
                     let vp = info.viewport_in_pixels();
+                    let clip = info.clip_rect_in_pixels();
                     if let Err(err) = renderer.draw(
                         painter,
                         atlas_tex,
                         [vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px],
+                        [clip.left_px, clip.from_bottom_px, clip.width_px, clip.height_px],
                         info.pixels_per_point,
                         &data,
                         &saved,
@@ -262,11 +264,44 @@ struct FboTarget {
     size: [i32; 2],
 }
 
+struct TextLocs {
+    atlas: Option<glow::UniformLocation>,
+    rect: Option<glow::UniformLocation>,
+}
+
+struct BlurHLocs {
+    src: Option<glow::UniformLocation>,
+    tex_scale: Option<glow::UniformLocation>,
+    uv_max: Option<glow::UniformLocation>,
+    step_x: Option<glow::UniformLocation>,
+    sigma: Option<glow::UniformLocation>,
+}
+
+struct CompLocs {
+    blur_h: Option<glow::UniformLocation>,
+    sharp: Option<glow::UniformLocation>,
+    tex_scale: Option<glow::UniformLocation>,
+    uv_max: Option<glow::UniformLocation>,
+    step_y: Option<glow::UniformLocation>,
+    sigma: Option<glow::UniformLocation>,
+    mode: Option<glow::UniformLocation>,
+    opacity: Option<glow::UniformLocation>,
+    glow_strength: Option<glow::UniformLocation>,
+    inner_glow: Option<glow::UniformLocation>,
+    ppp: Option<glow::UniformLocation>,
+    step_xy: Option<glow::UniformLocation>,
+    mask: Option<glow::UniformLocation>,
+    fade: Option<glow::UniformLocation>,
+}
+
 struct Renderer {
     gl: Weak<glow::Context>,
     text_prog: glow::Program,
     blur_h_prog: glow::Program,
     comp_prog: glow::Program,
+    text_locs: TextLocs,
+    blur_h_locs: BlurHLocs,
+    comp_locs: CompLocs,
     text_vao: glow::VertexArray,
     text_vbo: glow::Buffer,
     text_ebo: glow::Buffer,
@@ -288,6 +323,30 @@ impl Drop for Renderer {
                     text_prog: self.text_prog,
                     blur_h_prog: self.blur_h_prog,
                     comp_prog: self.comp_prog,
+                    text_locs: TextLocs { atlas: None, rect: None },
+                    blur_h_locs: BlurHLocs {
+                        src: None,
+                        tex_scale: None,
+                        uv_max: None,
+                        step_x: None,
+                        sigma: None,
+                    },
+                    comp_locs: CompLocs {
+                        blur_h: None,
+                        sharp: None,
+                        tex_scale: None,
+                        uv_max: None,
+                        step_y: None,
+                        sigma: None,
+                        mode: None,
+                        opacity: None,
+                        glow_strength: None,
+                        inner_glow: None,
+                        ppp: None,
+                        step_xy: None,
+                        mask: None,
+                        fade: None,
+                    },
                     text_vao: self.text_vao,
                     text_vbo: self.text_vbo,
                     text_ebo: self.text_ebo,
@@ -401,19 +460,30 @@ void main() {
         frag_color = texture(u_src, clamp(uv, vec2(0.0), u_uv_max));
         return;
     }
-    int rad = clamp(int(ceil(u_sigma * 2.6)), 1, 28);
+    int rad = clamp(int(ceil(u_sigma * 2.5)), 1, 28);
     float inv_2s2 = 0.5 / max(u_sigma * u_sigma, 0.0001);
     vec4 sum = texture(u_src, clamp(uv, vec2(0.0), u_uv_max));
     float wsum = 1.0;
-    for (int i = 1; i <= 28; ++i) {
+    // Bilinear-paired Gaussian taps: combine adjacent pixels (i, i+1) into one hardware-filtered fetch.
+    for (int i = 1; i <= 28; i += 2) {
         if (i > rad) break;
         float fi = float(i);
-        float w = exp(-fi * fi * inv_2s2);
-        vec2 off = vec2(u_step_x * fi, 0.0);
-        vec2 u1 = clamp(uv + off, vec2(0.0), u_uv_max);
-        vec2 u2 = clamp(uv - off, vec2(0.0), u_uv_max);
-        sum += (texture(u_src, u1) + texture(u_src, u2)) * w;
-        wsum += 2.0 * w;
+        float w1 = exp(-fi * fi * inv_2s2);
+        if (i + 1 <= rad) {
+            float fi2 = fi + 1.0;
+            float w2 = exp(-fi2 * fi2 * inv_2s2);
+            float w = w1 + w2;
+            float off_px = (fi * w1 + fi2 * w2) / max(w, 1e-6);
+            vec2 off = vec2(u_step_x * off_px, 0.0);
+            sum += (texture(u_src, clamp(uv + off, vec2(0.0), u_uv_max))
+                  + texture(u_src, clamp(uv - off, vec2(0.0), u_uv_max))) * w;
+            wsum += 2.0 * w;
+        } else {
+            vec2 off = vec2(u_step_x * fi, 0.0);
+            sum += (texture(u_src, clamp(uv + off, vec2(0.0), u_uv_max))
+                  + texture(u_src, clamp(uv - off, vec2(0.0), u_uv_max))) * w1;
+            wsum += 2.0 * w1;
+        }
     }
     frag_color = sum / wsum;
 }
@@ -458,19 +528,29 @@ void main() {
     if (u_sigma <= 0.15) {
         blurred = texture(u_blur_h, clamp(uv, vec2(0.0), u_uv_max));
     } else {
-        int rad = clamp(int(ceil(u_sigma * 2.6)), 1, 28);
+        int rad = clamp(int(ceil(u_sigma * 2.5)), 1, 28);
         float inv_2s2 = 0.5 / max(u_sigma * u_sigma, 0.0001);
         vec4 sum = texture(u_blur_h, clamp(uv, vec2(0.0), u_uv_max));
         float wsum = 1.0;
-        for (int i = 1; i <= 28; ++i) {
+        for (int i = 1; i <= 28; i += 2) {
             if (i > rad) break;
             float fi = float(i);
-            float w = exp(-fi * fi * inv_2s2);
-            vec2 off = vec2(0.0, u_step_y * fi);
-            vec2 u1 = clamp(uv + off, vec2(0.0), u_uv_max);
-            vec2 u2 = clamp(uv - off, vec2(0.0), u_uv_max);
-            sum += (texture(u_blur_h, u1) + texture(u_blur_h, u2)) * w;
-            wsum += 2.0 * w;
+            float w1 = exp(-fi * fi * inv_2s2);
+            if (i + 1 <= rad) {
+                float fi2 = fi + 1.0;
+                float w2 = exp(-fi2 * fi2 * inv_2s2);
+                float w = w1 + w2;
+                float off_px = (fi * w1 + fi2 * w2) / max(w, 1e-6);
+                vec2 off = vec2(0.0, u_step_y * off_px);
+                sum += (texture(u_blur_h, clamp(uv + off, vec2(0.0), u_uv_max))
+                      + texture(u_blur_h, clamp(uv - off, vec2(0.0), u_uv_max))) * w;
+                wsum += 2.0 * w;
+            } else {
+                vec2 off = vec2(0.0, u_step_y * fi);
+                sum += (texture(u_blur_h, clamp(uv + off, vec2(0.0), u_uv_max))
+                      + texture(u_blur_h, clamp(uv - off, vec2(0.0), u_uv_max))) * w1;
+                wsum += 2.0 * w1;
+            }
         }
         blurred = sum / wsum;
     }
@@ -540,11 +620,42 @@ impl Renderer {
             gl.enable_vertex_attrib_array(3);
             gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 32);
 
+            let text_locs = TextLocs {
+                atlas: gl.get_uniform_location(text_prog, "u_atlas"),
+                rect: gl.get_uniform_location(text_prog, "u_rect"),
+            };
+            let blur_h_locs = BlurHLocs {
+                src: gl.get_uniform_location(blur_h_prog, "u_src"),
+                tex_scale: gl.get_uniform_location(blur_h_prog, "u_tex_scale"),
+                uv_max: gl.get_uniform_location(blur_h_prog, "u_uv_max"),
+                step_x: gl.get_uniform_location(blur_h_prog, "u_step_x"),
+                sigma: gl.get_uniform_location(blur_h_prog, "u_sigma"),
+            };
+            let comp_locs = CompLocs {
+                blur_h: gl.get_uniform_location(comp_prog, "u_blur_h"),
+                sharp: gl.get_uniform_location(comp_prog, "u_sharp"),
+                tex_scale: gl.get_uniform_location(comp_prog, "u_tex_scale"),
+                uv_max: gl.get_uniform_location(comp_prog, "u_uv_max"),
+                step_y: gl.get_uniform_location(comp_prog, "u_step_y"),
+                sigma: gl.get_uniform_location(comp_prog, "u_sigma"),
+                mode: gl.get_uniform_location(comp_prog, "u_mode"),
+                opacity: gl.get_uniform_location(comp_prog, "u_opacity"),
+                glow_strength: gl.get_uniform_location(comp_prog, "u_glow_strength"),
+                inner_glow: gl.get_uniform_location(comp_prog, "u_inner_glow"),
+                ppp: gl.get_uniform_location(comp_prog, "u_ppp"),
+                step_xy: gl.get_uniform_location(comp_prog, "u_step_xy"),
+                mask: gl.get_uniform_location(comp_prog, "u_mask"),
+                fade: gl.get_uniform_location(comp_prog, "u_fade"),
+            };
+
             Ok(Self {
                 gl: Arc::downgrade(gl),
                 text_prog,
                 blur_h_prog,
                 comp_prog,
+                text_locs,
+                blur_h_locs,
+                comp_locs,
                 text_vao,
                 text_vbo,
                 text_ebo,
@@ -620,11 +731,13 @@ impl Renderer {
         Ok((tex, fbo, [alloc_w, alloc_h]))
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw(
         &mut self,
         painter: &Painter,
         atlas_tex: glow::Texture,
         vp: [i32; 4],
+        clip: [i32; 4],
         ppp: f32,
         data: &LineDrawData,
         saved: &GlState,
@@ -636,25 +749,34 @@ impl Renderer {
             return Ok(());
         }
 
-        let (tex_a, fbo_a, size_a) = Self::ensure_fbo(gl, &mut self.fbo_a, w_px, h_px)?;
-        let (tex_b, fbo_b, size_b) = Self::ensure_fbo(gl, &mut self.fbo_b, w_px, h_px)?;
-
         let p = &data.params;
         let is_active_glow = p.glow_strength > 0.01 && p.glow_sigma_pt > 0.1;
-        let sigma_px = if is_active_glow {
+        let full_sigma_px = if is_active_glow {
             (p.glow_sigma_pt * ppp).clamp(0.0, 26.0)
         } else {
             (p.blur_sigma_pt * ppp).clamp(0.0, 26.0)
         };
+        // Inactive blurred lines (`sigma >= 1.5px`) are band-limited: running their offscreen
+        // Gaussian passes at half resolution cuts fragment + texture work by ~8x with identical output.
+        let half_res = !is_active_glow && full_sigma_px >= 1.5 && w_px >= 8 && h_px >= 8;
+        let (fbo_w, fbo_h, sigma_px) = if half_res {
+            (((w_px + 1) / 2).max(1), ((h_px + 1) / 2).max(1), full_sigma_px * 0.5)
+        } else {
+            (w_px, h_px, full_sigma_px)
+        };
 
-        // Pass 1: Render crisp glyph triangles into FBO A (`0..w_px, 0..h_px`).
+        let (tex_a, fbo_a, size_a) = Self::ensure_fbo(gl, &mut self.fbo_a, fbo_w, fbo_h)?;
+        let (tex_b, fbo_b, size_b) = Self::ensure_fbo(gl, &mut self.fbo_b, fbo_w, fbo_h)?;
+
+        // Pass 1: Render glyph triangles into FBO A (`0..fbo_w, 0..fbo_h`) with scissor-bounded clear.
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, None);
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, None);
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
-        gl.viewport(0, 0, w_px, h_px);
-        gl.disable(glow::SCISSOR_TEST);
+        gl.viewport(0, 0, fbo_w, fbo_h);
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(0, 0, fbo_w, fbo_h);
         gl.color_mask(true, true, true, true);
         gl.enable(glow::BLEND);
         gl.blend_func_separate(
@@ -669,9 +791,9 @@ impl Renderer {
         gl.use_program(Some(self.text_prog));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
-        gl.uniform_1_i32(gl.get_uniform_location(self.text_prog, "u_atlas").as_ref(), 0);
+        gl.uniform_1_i32(self.text_locs.atlas.as_ref(), 0);
         gl.uniform_4_f32(
-            gl.get_uniform_location(self.text_prog, "u_rect").as_ref(),
+            self.text_locs.rect.as_ref(),
             data.draw_rect.min.x,
             data.draw_rect.min.y,
             1.0 / data.draw_rect.width().max(1e-4),
@@ -699,49 +821,40 @@ impl Renderer {
             0,
         );
 
-        // Pass 2: Horizontal 1D Gaussian blur (FBO A -> FBO B).
+        // Pass 2: Horizontal 1D Gaussian blur (FBO A -> FBO B). Skip completely when sigma <= 0.15.
         // Unbind `TEXTURE0`/`TEXTURE1` before switching FBO target to avoid any texture-FBO feedback hazard.
-        gl.active_texture(glow::TEXTURE1);
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b));
-        gl.viewport(0, 0, w_px, h_px);
-        gl.disable(glow::BLEND);
-        gl.use_program(Some(self.blur_h_prog));
-        gl.bind_vertex_array(Some(self.quad_vao));
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
-        gl.uniform_1_i32(gl.get_uniform_location(self.blur_h_prog, "u_src").as_ref(), 0);
-        let scale_ax = w_px as f32 / size_a[0] as f32;
-        let scale_ay = h_px as f32 / size_a[1] as f32;
-        let max_ax = (w_px as f32 - 0.5).max(0.5) / size_a[0] as f32;
-        let max_ay = (h_px as f32 - 0.5).max(0.5) / size_a[1] as f32;
-        gl.uniform_2_f32(
-            gl.get_uniform_location(self.blur_h_prog, "u_tex_scale").as_ref(),
-            scale_ax,
-            scale_ay,
-        );
-        gl.uniform_2_f32(
-            gl.get_uniform_location(self.blur_h_prog, "u_uv_max").as_ref(),
-            max_ax,
-            max_ay,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.blur_h_prog, "u_step_x").as_ref(),
-            1.0 / size_a[0] as f32,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.blur_h_prog, "u_sigma").as_ref(),
-            sigma_px,
-        );
-        gl.draw_arrays(glow::TRIANGLES, 0, 3);
+        let need_blur = sigma_px > 0.15;
+        if need_blur {
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b));
+            gl.viewport(0, 0, fbo_w, fbo_h);
+            gl.scissor(0, 0, fbo_w, fbo_h);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(self.blur_h_prog));
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+            gl.uniform_1_i32(self.blur_h_locs.src.as_ref(), 0);
+            let scale_ax = fbo_w as f32 / size_a[0] as f32;
+            let scale_ay = fbo_h as f32 / size_a[1] as f32;
+            let max_ax = (fbo_w as f32 - 0.5).max(0.5) / size_a[0] as f32;
+            let max_ay = (fbo_h as f32 - 0.5).max(0.5) / size_a[1] as f32;
+            gl.uniform_2_f32(self.blur_h_locs.tex_scale.as_ref(), scale_ax, scale_ay);
+            gl.uniform_2_f32(self.blur_h_locs.uv_max.as_ref(), max_ax, max_ay);
+            gl.uniform_1_f32(self.blur_h_locs.step_x.as_ref(), 1.0 / size_a[0] as f32);
+            gl.uniform_1_f32(self.blur_h_locs.sigma.as_ref(), sigma_px);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+        }
 
         // Pass 3: Vertical 1D Gaussian blur + viewport fade + crisp foreground composite -> screen FBO.
         gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
         gl.viewport(vp[0], vp[1], vp[2], vp[3]);
-        if saved.scissor {
-            gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(clip[0], clip[1], clip[2], clip[3]);
+        if !saved.scissor {
+            gl.disable(glow::SCISSOR_TEST);
         }
         gl.enable(glow::BLEND);
         gl.blend_func_separate(
@@ -753,72 +866,40 @@ impl Renderer {
         gl.use_program(Some(self.comp_prog));
         gl.bind_vertex_array(Some(self.quad_vao));
 
+        let (blur_tex, blur_size) = if need_blur { (tex_b, size_b) } else { (tex_a, size_a) };
         gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
-        gl.uniform_1_i32(gl.get_uniform_location(self.comp_prog, "u_blur_h").as_ref(), 0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(blur_tex));
+        gl.uniform_1_i32(self.comp_locs.blur_h.as_ref(), 0);
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
-        gl.uniform_1_i32(gl.get_uniform_location(self.comp_prog, "u_sharp").as_ref(), 1);
+        gl.uniform_1_i32(self.comp_locs.sharp.as_ref(), 1);
 
-        let scale_bx = w_px as f32 / size_b[0] as f32;
-        let scale_by = h_px as f32 / size_b[1] as f32;
-        let max_bx = (w_px as f32 - 0.5).max(0.5) / size_b[0] as f32;
-        let max_by = (h_px as f32 - 0.5).max(0.5) / size_b[1] as f32;
+        let scale_bx = fbo_w as f32 / blur_size[0] as f32;
+        let scale_by = fbo_h as f32 / blur_size[1] as f32;
+        let max_bx = (fbo_w as f32 - 0.5).max(0.5) / blur_size[0] as f32;
+        let max_by = (fbo_h as f32 - 0.5).max(0.5) / blur_size[1] as f32;
+        gl.uniform_2_f32(self.comp_locs.tex_scale.as_ref(), scale_bx, scale_by);
+        gl.uniform_2_f32(self.comp_locs.uv_max.as_ref(), max_bx, max_by);
+        gl.uniform_1_f32(self.comp_locs.step_y.as_ref(), 1.0 / blur_size[1] as f32);
+        gl.uniform_1_f32(self.comp_locs.sigma.as_ref(), sigma_px);
+        gl.uniform_1_i32(self.comp_locs.mode.as_ref(), if is_active_glow { 1 } else { 0 });
+        gl.uniform_1_f32(self.comp_locs.opacity.as_ref(), p.opacity);
+        gl.uniform_1_f32(self.comp_locs.glow_strength.as_ref(), p.glow_strength);
+        gl.uniform_1_f32(self.comp_locs.inner_glow.as_ref(), p.inner_glow_strength);
+        gl.uniform_1_f32(self.comp_locs.ppp.as_ref(), ppp);
         gl.uniform_2_f32(
-            gl.get_uniform_location(self.comp_prog, "u_tex_scale").as_ref(),
-            scale_bx,
-            scale_by,
-        );
-        gl.uniform_2_f32(
-            gl.get_uniform_location(self.comp_prog, "u_uv_max").as_ref(),
-            max_bx,
-            max_by,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.comp_prog, "u_step_y").as_ref(),
-            1.0 / size_b[1] as f32,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.comp_prog, "u_sigma").as_ref(),
-            sigma_px,
-        );
-        gl.uniform_1_i32(
-            gl.get_uniform_location(self.comp_prog, "u_mode").as_ref(),
-            if is_active_glow { 1 } else { 0 },
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.comp_prog, "u_opacity").as_ref(),
-            p.opacity,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.comp_prog, "u_glow_strength").as_ref(),
-            p.glow_strength,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.comp_prog, "u_inner_glow").as_ref(),
-            p.inner_glow_strength,
-        );
-        gl.uniform_1_f32(
-            gl.get_uniform_location(self.comp_prog, "u_ppp").as_ref(),
-            ppp,
-        );
-        gl.uniform_2_f32(
-            gl.get_uniform_location(self.comp_prog, "u_step_xy").as_ref(),
+            self.comp_locs.step_xy.as_ref(),
             1.0 / size_a[0] as f32,
             1.0 / size_a[1] as f32,
         );
         gl.uniform_4_f32(
-            gl.get_uniform_location(self.comp_prog, "u_mask").as_ref(),
+            self.comp_locs.mask.as_ref(),
             data.draw_rect.min.y,
             data.draw_rect.max.y,
             p.viewport.top(),
             p.viewport.bottom(),
         );
-        gl.uniform_2_f32(
-            gl.get_uniform_location(self.comp_prog, "u_fade").as_ref(),
-            p.pad_h,
-            p.fade_h,
-        );
+        gl.uniform_2_f32(self.comp_locs.fade.as_ref(), p.pad_h, p.fade_h);
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
         Ok(())
     }

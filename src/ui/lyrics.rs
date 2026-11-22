@@ -3733,15 +3733,18 @@ fn line_seek_time(line: &LyricLine, char_index: Option<usize>) -> Option<u64> {
         .or(line.time_ms)
 }
 
-#[derive(Clone, Default)]
-struct BalancedWidthCache {
-    entries: std::collections::HashMap<u64, f32>,
+#[derive(Default)]
+struct BalancedGalleyCache {
+    atlas_size: [usize; 2],
+    ppp_bits: u32,
+    entries: std::collections::HashMap<u64, std::sync::Arc<egui::Galley>>,
 }
 
 /// Lays out a lyric line at constant base font size with CSS `text-wrap: balance` semantics
 /// so wrapped lines never leave lonely 1-word orphans and never re-wrap when scaled.
-/// Memoizes the solved balanced width per `(text, size, wrap_w, right_align)` so scrolling at 60fps
-/// shapes each line once per frame instead of 7 times.
+/// Memoizes the shaped `Arc<egui::Galley>` inside an `Arc<Mutex<...>>` (zero HashMap cloning!)
+/// keyed by `(text, size, wrap_w, right_align)` and automatically invalidated if `ppp` or the
+/// font atlas dimensions change.
 fn layout_balanced_lyric(
     ui: &Ui,
     display: &str,
@@ -3750,6 +3753,7 @@ fn layout_balanced_lyric(
     right_align: bool,
 ) -> std::sync::Arc<egui::Galley> {
     use std::hash::{Hash, Hasher};
+    use std::sync::{Arc, Mutex};
     let font = lyric_font(ui, size);
     let make = |w: f32| {
         let mut job = egui::text::LayoutJob::single_section(
@@ -3774,17 +3778,25 @@ fn layout_balanced_lyric(
     (wrap_w.round() as i32).hash(&mut hasher);
     right_align.hash(&mut hasher);
     let cache_key = hasher.finish();
-    let cache_id = egui::Id::NULL.with("lyrics-balanced-w-cache");
-    if let Some(cached_w) = ui
-        .ctx()
-        .data(|d| d.get_temp::<BalancedWidthCache>(cache_id).and_then(|c| c.entries.get(&cache_key).copied()))
-    {
-        return make(cached_w);
+    let atlas_size = ui.fonts(|f| f.font_image_size());
+    let ppp_bits = ui.ctx().pixels_per_point().to_bits();
+    let cache_id = egui::Id::NULL.with("lyrics-balanced-galley-cache");
+    let cache_arc: Arc<Mutex<BalancedGalleyCache>> = ui.ctx().data_mut(|d| {
+        d.get_temp_mut_or_insert_with(cache_id, || Arc::new(Mutex::new(BalancedGalleyCache::default())))
+            .clone()
+    });
+    if let Ok(mut cache) = cache_arc.lock() {
+        if cache.atlas_size != atlas_size || cache.ppp_bits != ppp_bits {
+            cache.entries.clear();
+            cache.atlas_size = atlas_size;
+            cache.ppp_bits = ppp_bits;
+        } else if let Some(hit) = cache.entries.get(&cache_key) {
+            return hit.clone();
+        }
     }
 
     let galley = make(wrap_w);
     let row_count = galley.rows.len();
-    let mut solved_w = wrap_w;
     let mut best = galley;
     if row_count >= 2 {
         let max_row_w = best
@@ -3802,7 +3814,6 @@ fn layout_balanced_lyric(
                 let cand = make(mid);
                 if cand.rows.len() <= row_count {
                     best = cand;
-                    solved_w = mid;
                     hi = mid;
                 } else {
                     lo = mid;
@@ -3810,14 +3821,19 @@ fn layout_balanced_lyric(
             }
         }
     }
-    ui.ctx().data_mut(|d| {
-        let mut cache = d.get_temp::<BalancedWidthCache>(cache_id).unwrap_or_default();
+    // Re-read atlas_size after shaping (in case new glyphs grew the font atlas during this call).
+    let post_atlas = ui.fonts(|f| f.font_image_size());
+    if let Ok(mut cache) = cache_arc.lock() {
+        if cache.atlas_size != post_atlas {
+            cache.entries.clear();
+            cache.atlas_size = post_atlas;
+            cache.ppp_bits = ppp_bits;
+        }
         if cache.entries.len() >= 512 {
             cache.entries.clear();
         }
-        cache.entries.insert(cache_key, solved_w);
-        d.insert_temp(cache_id, cache);
-    });
+        cache.entries.insert(cache_key, best.clone());
+    }
     best
 }
 

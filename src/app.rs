@@ -311,6 +311,9 @@ pub struct App {
     session_played_yt: HashSet<String>,
     last_yt_seed: Option<String>,
     last_prefetched_next: Option<TrackId>,
+    /// Defers next-track stream/lyrics/autoplay prefetch by ~2s after a track change so the
+    /// newly selected song and its own lyrics get 100% of network bandwidth first.
+    next_prefetch_due: Option<Instant>,
     autoplay_req_id: u64,
     autoplay_response: Option<(u64, bool, Receiver<Result<Vec<crate::ytm::Item>, crate::ytm::Error>>)>,
     pub top_popover: Option<TopPopover>,
@@ -327,6 +330,7 @@ pub struct App {
     can_save_user: bool,
     last_save: Instant,
     library_dirty: bool,
+    persist_tx: Option<mpsc::Sender<PersistJob>>,
     context: egui::Context,
     #[cfg(windows)]
     hwnd: Option<isize>,
@@ -338,6 +342,42 @@ pub struct App {
     frame: u64,
     shot_requested: bool,
     shot_done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum PersistJob {
+    User(UserData),
+    Library(Vec<Track>),
+}
+
+fn start_persist_worker() -> Option<mpsc::Sender<PersistJob>> {
+    let (tx, rx) = mpsc::channel::<PersistJob>();
+    std::thread::Builder::new()
+        .name("persist".into())
+        .spawn(move || {
+            while let Ok(first) = rx.recv() {
+                // Coalesce burst writes so only the newest user/library snapshots hit disk.
+                let mut latest_user: Option<UserData> = None;
+                let mut latest_lib: Option<Vec<Track>> = None;
+                match first {
+                    PersistJob::User(u) => latest_user = Some(u),
+                    PersistJob::Library(t) => latest_lib = Some(t),
+                }
+                while let Ok(next) = rx.try_recv() {
+                    match next {
+                        PersistJob::User(u) => latest_user = Some(u),
+                        PersistJob::Library(t) => latest_lib = Some(t),
+                    }
+                }
+                if let Some(tracks) = latest_lib {
+                    let _ = library::write_library_cache_tracks(&tracks);
+                }
+                if let Some(user) = latest_user {
+                    let _ = library::save_user(&user);
+                }
+            }
+        })
+        .ok()?;
+    Some(tx)
 }
 
 fn audio_settings(data: &UserData) -> AudioSettings {
@@ -419,6 +459,7 @@ impl App {
             session_played_yt: HashSet::new(),
             last_yt_seed: None,
             last_prefetched_next: None,
+            next_prefetch_due: None,
             autoplay_req_id: 0,
             autoplay_response: None,
             top_popover: None,
@@ -435,6 +476,7 @@ impl App {
             can_save_user,
             last_save: Instant::now(),
             library_dirty: false,
+            persist_tx: if demo_mode { None } else { start_persist_worker() },
             context: ctx.clone(),
             #[cfg(windows)]
             hwnd: None,
@@ -482,6 +524,7 @@ impl App {
                 }
             }
         } else {
+            crate::ytm::warm_stream_client();
             app.restore_session();
             app.setup_media(cc);
         }
@@ -1120,8 +1163,10 @@ impl App {
 
     /// Everything that has to follow the current song changing.
     fn after_track_change(&mut self) {
-        self.sync_next();
-        self.maybe_prefetch_autoplay();
+        self.sync_next_engine_only();
+        // Defer heavy next-track network prefetching (next stream URL, next lyrics, autoplay radio)
+        // for 2s so the current track and its own lyrics get 100% of network bandwidth immediately.
+        self.next_prefetch_due = Some(Instant::now() + Duration::from_secs(2));
         self.dirty = true;
         self.lyrics = None;
         self.lyrics_for = None;
@@ -1172,7 +1217,7 @@ impl App {
         self.ytm.search_changed();
     }
 
-    fn sync_next(&mut self) {
+    fn sync_next_engine_only(&mut self) {
         let s = &self.data.settings;
         let next = self.player.peek_next().and_then(|id| self.lib.track(id)).filter(|track| Self::can_play_track(track));
         let spec = next.as_ref().map(|next| {
@@ -1180,7 +1225,15 @@ impl App {
             self.track_load_spec(next, how)
         });
         self.engine.set_next(spec);
+    }
 
+    fn sync_next(&mut self) {
+        self.sync_next_engine_only();
+        self.prefetch_next_resources();
+    }
+
+    fn prefetch_next_resources(&mut self) {
+        let next = self.player.peek_next().and_then(|id| self.lib.track(id)).filter(|track| Self::can_play_track(track));
         // Proactively prefetch next track's artwork, YouTube audio stream URL, and synced lyrics once per next-track change.
         let next_id = next.as_ref().map(|t| t.id);
         if self.screenshot.is_none() && !self.lib.demo && next_id != self.last_prefetched_next {
@@ -1199,6 +1252,16 @@ impl App {
                 }
             }
         }
+    }
+
+    fn pump_deferred_prefetch(&mut self) {
+        let Some(due) = self.next_prefetch_due else { return };
+        if !self.is_playing() || Instant::now() < due {
+            return;
+        }
+        self.next_prefetch_due = None;
+        self.prefetch_next_resources();
+        self.maybe_prefetch_autoplay();
     }
 
     pub fn tracks_of(&self, item: &RecentItem) -> (ContextRef, String, Vec<TrackId>) {
@@ -2440,21 +2503,35 @@ impl App {
         }
         self.last_save = Instant::now();
         if self.library_dirty {
-            self.library_dirty = library::save_library_cache_pruned(&self.lib, &self.data).is_err();
-            if self.library_dirty {
-                self.toast(self.t("Không thể lưu thư viện", "Could not save library").into());
-                return;
+            if let Some(tx) = &self.persist_tx {
+                let tracks = library::snapshot_pruned_library_cache(&self.lib, &self.data);
+                if tx.send(PersistJob::Library(tracks)).is_ok() {
+                    self.library_dirty = false;
+                }
+            } else {
+                self.library_dirty = library::save_library_cache_pruned(&self.lib, &self.data).is_err();
+                if self.library_dirty {
+                    self.toast(self.t("Không thể lưu thư viện", "Could not save library").into());
+                    return;
+                }
             }
         }
         if self.can_save_user && (self.dirty || (!self.lib.demo && self.is_playing())) {
-            self.dirty = self.store_user().is_err();
-            if self.dirty {
-                self.toast(self.t("Không thể ghi dữ liệu Nhịp", "Could not save Nhịp data").into());
+            if let Some(tx) = &self.persist_tx {
+                let snapshot = self.user_save_snapshot();
+                if tx.send(PersistJob::User(snapshot)).is_ok() {
+                    self.dirty = false;
+                }
+            } else {
+                self.dirty = self.store_user().is_err();
+                if self.dirty {
+                    self.toast(self.t("Không thể ghi dữ liệu Nhịp", "Could not save Nhịp data").into());
+                }
             }
         }
     }
 
-    fn store_user(&self) -> std::io::Result<()> {
+    fn user_save_snapshot(&self) -> UserData {
         let mut data = self.data.clone();
         data.playlists.retain(|p| !self.demo_playlist_ids.contains(&p.id));
         if self.lib.demo {
@@ -2463,7 +2540,11 @@ impl App {
         } else {
             data.session = self.player.snapshot(self.position_ms());
         }
-        library::save_user(&data)
+        data
+    }
+
+    fn store_user(&self) -> std::io::Result<()> {
+        library::save_user(&self.user_save_snapshot())
     }
 
     fn import_lyrics(&mut self, track: &Track) {
@@ -2612,33 +2693,49 @@ impl App {
                     let wake = self.context.clone();
                     let spicy_cfg = crate::spicy::SpicyApiConfig::from_settings(&self.data.settings);
                     let _ = std::thread::Builder::new().name("lyrics".into()).spawn(move || {
-                        let lyrics = crate::ytm::online_lyrics_with_config(&track, &spicy_cfg);
-                        let _ = tx.send(lyrics);
-                        wake.request_repaint();
+                        let tx_up = tx.clone();
+                        let wake_up = wake.clone();
+                        let final_res = crate::ytm::online_lyrics_progressive(&track, &spicy_cfg, move |l| {
+                            let _ = tx_up.send(Some(l));
+                            wake_up.request_repaint();
+                        });
+                        if final_res.is_none() {
+                            let _ = tx.send(None);
+                            wake.request_repaint();
+                        }
                     });
                     self.lyrics_response = Some((id, rx));
                 }
             }
         }
-        if let Some((req_id, rx)) = &self.lyrics_response {
-            let req_id = *req_id;
-            match rx.try_recv() {
-                Ok(lyrics) => {
-                    // Guard against stale track responses overwriting the currently playing track's lyrics.
-                    if self.lyrics_for == Some(req_id) && self.player.current == Some(req_id) {
-                        self.lyrics = lyrics;
+        if let Some((req_id, rx)) = self.lyrics_response.take() {
+            let mut keep = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(Some(lyrics)) => {
+                        if self.lyrics_for == Some(req_id) && self.player.current == Some(req_id) {
+                            self.lyrics = Some(lyrics);
+                        } else {
+                            keep = false;
+                            break;
+                        }
                     }
-                    self.lyrics_response = None;
+                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                        keep = false;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.lyrics_response = None,
-                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if keep && self.lyrics_for == Some(req_id) && self.player.current == Some(req_id) {
+                self.lyrics_response = Some((req_id, rx));
             }
         }
         self.lyrics.as_ref()
     }
 
     pub fn lyrics_loading(&self) -> bool {
-        self.lyrics_response.is_some()
+        self.lyrics.is_none() && self.lyrics_response.is_some()
     }
 
     fn exit_lyrics_fullscreen(&mut self) {
@@ -2894,6 +2991,7 @@ impl App {
                 }
             }
         }
+        self.pump_deferred_prefetch();
         self.save_if_due();
         if let Some((_, at)) = &self.toast {
             if at.elapsed() > Duration::from_secs(3) {
@@ -3062,6 +3160,7 @@ pub(crate) mod tests {
             session_played_yt: HashSet::new(),
             last_yt_seed: None,
             last_prefetched_next: None,
+            next_prefetch_due: None,
             autoplay_req_id: 0,
             autoplay_response: None,
             top_popover: None,
@@ -3078,6 +3177,7 @@ pub(crate) mod tests {
             can_save_user: false,
             last_save: Instant::now(),
             library_dirty: false,
+            persist_tx: None,
             context: ctx,
             #[cfg(windows)]
             hwnd: None,

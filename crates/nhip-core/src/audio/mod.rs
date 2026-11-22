@@ -357,6 +357,14 @@ enum Pending {
     Finished,
 }
 
+struct PendingLoad {
+    epoch: u64,
+    id: TrackId,
+    start_ms: u64,
+    play: bool,
+    rx: Receiver<Result<Deck, String>>,
+}
+
 struct Worker<F: Fn()> {
     rx: Receiver<Cmd>,
     pending_cmd: Option<Cmd>,
@@ -374,6 +382,9 @@ struct Worker<F: Fn()> {
     eq: Equalizer,
     limiter: Limiter,
     current: Option<Deck>,
+    /// In-flight non-blocking YouTube stream open so rapid track clicks, Pause, Stop, and Seek
+    /// never block behind a slow HTTPS resolve or Range download.
+    loading: Option<PendingLoad>,
     outgoing: Option<Outgoing>,
     next: Option<LoadSpec>,
     /// Pre-opened next deck for Gapless/Crossfade/manual Next so handovers never stall the mixer thread on HTTPS/IO.
@@ -426,6 +437,7 @@ impl<F: Fn()> Worker<F> {
             eq,
             limiter,
             current: None,
+            loading: None,
             outgoing: None,
             next: None,
             prepared_next: None,
@@ -591,6 +603,7 @@ impl<F: Fn()> Worker<F> {
     fn run(mut self) {
         loop {
             self.deliver_pending();
+            self.poll_loading_deck();
             self.poll_preloaded_next();
             self.check_output_health();
             let cmd = match self.next_command() {
@@ -639,6 +652,44 @@ impl<F: Fn()> Worker<F> {
                 raw_pos.saturating_sub(self.output.driver_latency_ms())
             };
             self.shared.position_ms.store(pos, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_loading_deck(&mut self) {
+        let Some(pending) = self.loading.take() else { return };
+        if self.load_epoch.load(Ordering::Acquire) != pending.epoch {
+            return;
+        }
+        match pending.rx.try_recv() {
+            Ok(Ok(mut deck)) => {
+                if self.load_epoch.load(Ordering::Acquire) != pending.epoch {
+                    return;
+                }
+                if pending.start_ms > 0 {
+                    deck.seek(pending.start_ms);
+                }
+                self.publish_new(&deck, pending.start_ms);
+                self.set_current(Some(deck));
+                self.shared.paused.store(!pending.play, Ordering::Relaxed);
+                self.last_consumed = self.output.consumed_frames();
+                self.last_consumed_at = Instant::now();
+                self.prepare_mix();
+                (self.on_event)();
+            }
+            Ok(Err(e)) => {
+                self.set_current(None);
+                self.shared.paused.store(true, Ordering::Relaxed);
+                if self.load_epoch.load(Ordering::Acquire) == pending.epoch {
+                    self.emit(Event::Error(pending.id, e));
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.set_current(None);
+                self.shared.paused.store(true, Ordering::Relaxed);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.loading = Some(pending);
+            }
         }
     }
 
@@ -718,6 +769,7 @@ impl<F: Fn()> Worker<F> {
         match cmd {
             Cmd::Load { spec, start_ms, play, epoch } => {
                 self.flush_output();
+                self.loading = None;
                 self.outgoing = None;
                 self.silence_frames = 0;
                 // Reuse preloaded deck on manual Next skip if it already finished opening for this track.
@@ -735,15 +787,39 @@ impl<F: Fn()> Worker<F> {
                     }
                     self.publish_new(&deck, start_ms);
                     self.set_current(Some(deck));
+                    self.prepare_mix();
+                    self.shared.paused.store(!play || self.current.is_none(), Ordering::Relaxed);
+                } else if matches!(spec.source, SourceSpec::YouTube { .. }) {
+                    // Open YouTube HTTPS streams on a non-blocking loader thread so clicking another
+                    // song, pausing, seeking, or stopping responds in < 5ms instead of blocking the
+                    // audio worker behind an 8-second HTTP request.
+                    self.current = None;
+                    // Mark loaded=true while in-flight so Pause/Play/Seek mutate the pending load
+                    // cleanly instead of restarting a duplicate HTTPS open.
+                    self.shared.loaded.store(true, Ordering::Relaxed);
+                    self.shared.duration_ms.store(spec.duration_ms, Ordering::Relaxed);
+                    self.shared.position_ms.store(start_ms, Ordering::Relaxed);
+                    self.shared.paused.store(!play, Ordering::Relaxed);
+                    let id = spec.id;
+                    let cancel = CancelSignal::Epoch { current: self.load_epoch.clone(), expected: epoch };
+                    let (tx, rx) = mpsc::channel();
+                    let _ = std::thread::Builder::new().name("audio-open".into()).spawn(move || {
+                        let _ = tx.send(Deck::open_with_cancel(&spec, cancel));
+                    });
+                    self.loading = Some(PendingLoad { epoch, id, start_ms, play, rx });
                 } else {
                     self.start_deck(&spec, start_ms, epoch);
+                    self.prepare_mix();
+                    self.shared.paused.store(!play || self.current.is_none(), Ordering::Relaxed);
                 }
-                self.prepare_mix();
-                self.shared.paused.store(!play || self.current.is_none(), Ordering::Relaxed);
             }
             Cmd::SetNext(spec) => {
                 self.next = spec;
-                self.prepare_mix();
+                // Wait until any in-flight current YouTube stream finishes opening before spawning
+                // competing next-track HTTPS preload traffic.
+                if self.loading.is_none() {
+                    self.prepare_mix();
+                }
             }
             Cmd::SetGain { id, gain_db } => {
                 if let Some(d) = self.current.as_mut().filter(|d| d.id == id) {
@@ -754,12 +830,25 @@ impl<F: Fn()> Worker<F> {
                 }
             }
             Cmd::Play => {
-                if self.current.is_some() {
+                if let Some(pending) = self.loading.as_mut() {
+                    pending.play = true;
+                    self.shared.paused.store(false, Ordering::Relaxed);
+                } else if self.current.is_some() {
                     self.shared.paused.store(false, Ordering::Relaxed);
                 }
             }
-            Cmd::Pause => self.shared.paused.store(true, Ordering::Relaxed),
+            Cmd::Pause => {
+                if let Some(pending) = self.loading.as_mut() {
+                    pending.play = false;
+                }
+                self.shared.paused.store(true, Ordering::Relaxed);
+            }
             Cmd::Seek { id, ms } => {
+                if let Some(pending) = self.loading.as_mut().filter(|p| p.id == id) {
+                    pending.start_ms = ms;
+                    self.shared.position_ms.store(ms, Ordering::Relaxed);
+                    return true;
+                }
                 if !self.current.as_ref().is_some_and(|deck| deck.id == id) {
                     let changing = self.pending.iter().any(|(_, event)| matches!(event, Pending::Advanced { .. }));
                     if !changing || !self.outgoing.as_ref().is_some_and(|old| old.deck.id == id) {
@@ -802,6 +891,7 @@ impl<F: Fn()> Worker<F> {
             }
             Cmd::Stop => {
                 self.flush_output();
+                self.loading = None;
                 self.set_current(None);
                 self.outgoing = None;
                 self.prepare_mix();
@@ -1128,6 +1218,50 @@ mod tests {
     }
 
     #[test]
+    fn pending_youtube_load_handles_pause_seek_and_superseding_load_without_blocking() {
+        let (_, commands) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let shared = Arc::new(Shared::new());
+        let load_epoch = Arc::new(AtomicU64::new(1));
+        let settings = AudioSettings { crossfade_ms: 0, eq_enabled: false, eq_gains: [0.0; 6] };
+        let mut worker = Worker::new(commands, events, shared.clone(), load_epoch.clone(), settings, true, || {});
+
+        // Simulate an in-flight slow YouTube open that hasn't delivered a deck yet.
+        let (tx, rx) = mpsc::channel();
+        worker.active_epoch = 1;
+        worker.shared.loaded.store(true, Ordering::Relaxed);
+        worker.shared.paused.store(false, Ordering::Relaxed);
+        worker.loading = Some(PendingLoad { epoch: 1, id: 10, start_ms: 0, play: true, rx });
+
+        // Pause and Seek update the pending load immediately without waiting for network completion.
+        assert!(worker.handle(Cmd::Pause));
+        assert!(shared.is_paused());
+        assert!(!worker.loading.as_ref().unwrap().play);
+
+        assert!(worker.handle(Cmd::Seek { id: 10, ms: 25_000 }));
+        assert_eq!(worker.loading.as_ref().unwrap().start_ms, 25_000);
+        assert_eq!(shared.position_ms.load(Ordering::Relaxed), 25_000);
+
+        // When the deck finally arrives, it lands seeked to 25_000 and honors paused=true.
+        let deck = Deck::open(&demo(10, 3, 60_000)).unwrap();
+        tx.send(Ok(deck)).unwrap();
+        worker.poll_loading_deck();
+        assert!(worker.loading.is_none());
+        assert_eq!(worker.current.as_ref().unwrap().id, 10);
+        assert!(shared.is_paused());
+        assert!((24_900..25_200).contains(&shared.position_ms.load(Ordering::Relaxed)));
+
+        // If a newer epoch supersedes an in-flight load, its late result is discarded cleanly.
+        let (tx2, rx2) = mpsc::channel();
+        load_epoch.store(2, Ordering::Release);
+        worker.loading = Some(PendingLoad { epoch: 1, id: 99, start_ms: 0, play: true, rx: rx2 });
+        tx2.send(Ok(Deck::open(&demo(99, 4, 30_000)).unwrap())).unwrap();
+        worker.poll_loading_deck();
+        assert!(worker.loading.is_none());
+        assert_eq!(worker.current.as_ref().unwrap().id, 10);
+    }
+
+    #[test]
     fn pausing_stops_the_clock_and_seeking_moves_it() {
         let e = engine(0);
         e.load(demo(1, 1, 30_000), 0, true);
@@ -1239,8 +1373,8 @@ mod http_range {
     use super::CancelSignal;
     use crate::ytm::{google_media_url, stream_http_agent, ResolvedStream};
 
-    pub(super) const CHUNK_SIZE: usize = 256 * 1024;
-    const MAX_CACHED_CHUNKS: usize = 16;
+    pub(super) const CHUNK_SIZE: usize = 128 * 1024;
+    const MAX_CACHED_CHUNKS: usize = 24;
     const READ_SLICE: usize = 32 * 1024;
 
     enum RangeErr {

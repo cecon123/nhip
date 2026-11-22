@@ -6,24 +6,63 @@ use serde::{Deserialize, Serialize};
 
 /// Verified from Spicy Lyrics `src/utils/Lyrics/lyrics.ts:12` (`getLyricsBetweenShow()` = 3s).
 pub const INTERLUDE_GAP_MS: u64 = 3_000;
-/// Minimum post-vocal gap required to infer an instrumental interlude on plain LRC lines lacking `end_ms`.
-pub const LRC_INFERRED_INTERLUDE_GAP_MS: u64 = 4_000;
+/// Minimum post-vocal gap required to infer an instrumental interlude on plain LRC / line-only tracks.
+pub const LRC_INFERRED_INTERLUDE_GAP_MS: u64 = 3_000;
 /// Conservative outro gap threshold so short track fadeouts do not flash spurious dots.
 pub const OUTRO_INTERLUDE_GAP_MS: u64 = 5_000;
 
-/// Returns `(end_ms, inferred)` for a vocal line. When `end_ms` and syllable `spans` are absent
-/// (standard LRC / LRCLIB line-synced files), estimates vocal finish time from character length
-/// so genuine instrumental breaks produce 3-dot interludes without false positives on slow ballads.
-fn effective_line_end_ms(line: &LyricLine) -> Option<(u64, bool)> {
-    if let Some(end) = line.end_ms {
+/// Computes a song's typical singing cadence in milliseconds per character from consecutive vocal
+/// line pairs, so fast pop/rap tracks infer shorter instrumental breaks (~5-6s) while slow ballads
+/// (~10s long lines) never emit false-positive interlude dots.
+fn song_cadence_ms_per_char(lines: &[LyricLine]) -> f64 {
+    let mut rates: Vec<f64> = Vec::new();
+    let mut prev: Option<(u64, usize)> = None;
+    for line in lines {
+        if line.background || is_instrumental_text(&line.text) {
+            continue;
+        }
+        let Some(start) = line.time_ms else { continue };
+        let chars = line.text.trim().chars().count();
+        if let Some((p_start, p_chars)) = prev {
+            let delta = start.saturating_sub(p_start);
+            if (1_200..13_500).contains(&delta) && p_chars >= 6 {
+                rates.push(delta as f64 / (p_chars.max(14) as f64));
+            }
+        }
+        prev = Some((start, chars));
+    }
+    if rates.len() < 3 {
+        return 110.0;
+    }
+    rates.sort_by(|a, b| a.total_cmp(b));
+    rates[rates.len() / 2].clamp(62.0, 145.0)
+}
+
+/// Returns `(end_ms, inferred)` for a vocal line.
+/// - Syllable/word-synced lines (`!spans.is_empty()`) use their exact `end_ms` / last span end.
+/// - Plain LRC / line-synced tracks (`spans.is_empty()`) estimate vocal duration using the song's
+///   adaptive cadence; this also unwraps upstream Musixmatch/LyricsPlus `Line`-only payloads that
+///   stretch `end_ms` all the way to `next_start` across long instrumental breaks.
+fn effective_line_end_ms(
+    line: &LyricLine,
+    next_start_ms: Option<u64>,
+    ms_per_char: f64,
+) -> Option<(u64, bool)> {
+    if let Some(last) = line.spans.last() {
+        let end = line.end_ms.map_or(last.end_ms, |e| e.max(last.end_ms));
         return Some((end, false));
     }
-    if let Some(last) = line.spans.last() {
-        return Some((last.end_ms, false));
-    }
     let start = line.time_ms?;
-    let chars = line.text.trim().chars().count() as u64;
-    let est_dur = (1_800 + chars.saturating_mul(135)).clamp(2_600, 8_500);
+    let chars = line.text.trim().chars().count() as f64;
+    let est_dur = (1_100.0 + chars * ms_per_char).clamp(1_900.0, 7_400.0).round() as u64;
+    if let Some(end) = line.end_ms {
+        let stretched_to_next = next_start_ms.is_some_and(|ns| ns.abs_diff(end) <= 300)
+            && end.saturating_sub(start) >= est_dur.saturating_add(LRC_INFERRED_INTERLUDE_GAP_MS);
+        if stretched_to_next {
+            return Some((start.saturating_add(est_dur), true));
+        }
+        return Some((end, false));
+    }
     Some((start.saturating_add(est_dur), true))
 }
 
@@ -142,7 +181,25 @@ pub fn provider_label_for_source(source: &str) -> &'static str {
 
 pub fn is_instrumental_text(text: &str) -> bool {
     let t = text.trim();
-    t.is_empty() || matches!(t, "♪" | "♫" | "♬" | "..." | "…" | "• • •" | "•••")
+    if t.is_empty() {
+        return true;
+    }
+    if t.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '♪' | '♫' | '♬' | '♩' | '🎵' | '🎶' | '.' | '…' | '•' | '·' | '・' | '~' | '-' | '—' | '–'
+            )
+    }) {
+        return true;
+    }
+    let lower = t
+        .trim_matches(|c| matches!(c, '(' | ')' | '[' | ']' | '（' | '）' | '【' | '】' | '♪' | '♫' | ' '))
+        .to_lowercase();
+    matches!(
+        lower.as_str(),
+        "instrumental" | "music" | "interlude" | "nhạc dạo" | "nhac dao" | "nhạc nền" | "dạo nhạc"
+    )
 }
 
 impl Lyrics {
@@ -246,6 +303,7 @@ impl Lyrics {
             return (0..self.lines.len()).map(LyricsEvent::VocalLine).collect();
         }
         let mut events = Vec::with_capacity(self.lines.len() + 4);
+        let ms_per_char = song_cadence_ms_per_char(&self.lines);
         let first_vocal = self
             .lines
             .iter()
@@ -312,9 +370,9 @@ impl Lyrics {
             // If this is a main vocal line, also emit its immediately following background vocals
             // before evaluating any interlude gap to the next main vocal line.
             if !line.background {
-                let mut group_end = effective_line_end_ms(line);
                 let mut j = i + 1;
                 let mut has_explicit_gap = false;
+                let mut bg_indices = Vec::new();
                 while let Some(cand) = self.lines.get(j) {
                     if is_instrumental_text(&cand.text) && cand.time_ms.is_some() {
                         has_explicit_gap = true;
@@ -322,21 +380,30 @@ impl Lyrics {
                     }
                     if cand.background {
                         events.push(LyricsEvent::VocalLine(j));
-                        if let Some((bg_end, bg_inf)) = effective_line_end_ms(cand) {
-                            group_end = Some(match group_end {
-                                Some((cur_end, cur_inf)) => {
-                                    if bg_end > cur_end {
-                                        (bg_end, bg_inf)
-                                    } else {
-                                        (cur_end, cur_inf)
-                                    }
-                                }
-                                None => (bg_end, bg_inf),
-                            });
-                        }
+                        bg_indices.push(j);
                         j += 1;
                     } else {
                         break;
+                    }
+                }
+                let next_main_start = (!has_explicit_gap)
+                    .then(|| self.lines.get(j).and_then(|n| n.time_ms))
+                    .flatten();
+                let mut group_end = effective_line_end_ms(line, next_main_start, ms_per_char);
+                for bg_idx in bg_indices {
+                    if let Some((bg_end, bg_inf)) =
+                        effective_line_end_ms(&self.lines[bg_idx], next_main_start, ms_per_char)
+                    {
+                        group_end = Some(match group_end {
+                            Some((cur_end, cur_inf)) => {
+                                if bg_end > cur_end {
+                                    (bg_end, bg_inf)
+                                } else {
+                                    (cur_end, cur_inf)
+                                }
+                            }
+                            None => (bg_end, bg_inf),
+                        });
                     }
                 }
                 if !has_explicit_gap {
@@ -371,7 +438,7 @@ impl Lyrics {
                 .lines
                 .iter()
                 .filter(|l| !is_instrumental_text(&l.text))
-                .filter_map(effective_line_end_ms)
+                .filter_map(|l| effective_line_end_ms(l, None, ms_per_char))
                 .map(|(end, _)| end)
                 .max();
             if let Some(last_end) = last_vocal_end {
@@ -664,5 +731,55 @@ mod tests {
         assert_eq!(tl[pos_1 + 2], LyricsEvent::VocalLine(3));
         assert_eq!(tl[pos_1 + 3], LyricsEvent::VocalLine(4));
         assert_eq!(tl[pos_1 + 4], LyricsEvent::VocalLine(5));
+    }
+
+    #[test]
+    fn build_timeline_unwraps_stretched_line_only_end_ms_and_recognizes_common_instrumental_markers() {
+        let mk = |start: u64, end: u64, text: &str| LyricLine {
+            time_ms: Some(start),
+            end_ms: Some(end),
+            text: text.to_string(),
+            spans: Vec::new(),
+            right_align: false,
+            background: false,
+        };
+        // Fast pop track where Musixmatch/LyricsPlus Line-only API stretches line 2's end_ms all the way
+        // to line 3 (12s gap across an instrumental chorus break) plus explicit "♪ ♪" and "(Instrumental)".
+        let lyrics = Lyrics {
+            lines: vec![
+                mk(5_000, 7_500, "Đêm nay phố mưa rơi"),
+                mk(7_500, 10_200, "Anh bước đi một mình"),
+                mk(10_200, 22_500, "Chẳng còn ai đợi chờ"),
+                mk(22_500, 25_000, "Gió thổi qua hàng cây"),
+                mk(25_000, 31_000, "♪ ♪"),
+                mk(31_000, 34_000, "Còn lại câu hát cũ"),
+                mk(34_000, 40_000, "(Instrumental)"),
+                mk(40_000, 43_000, "Hết bài"),
+            ],
+            synced: true,
+            songwriter: None,
+            provider: None,
+            source: None,
+            attribution: None,
+            track_ids: None,
+        };
+        let tl = lyrics.build_timeline(None);
+        let interludes: Vec<InterludeEvent> = tl
+            .iter()
+            .filter_map(|e| match *e {
+                LyricsEvent::Interlude(ev) => Some(ev),
+                _ => None,
+            })
+            .collect();
+        // Expect 4 interludes: intro (0..5s), stretched break after line 2 (..22.5s), "♪ ♪" (25..31s), "(Instrumental)" (34..40s).
+        assert_eq!(interludes.len(), 4, "got {interludes:?}");
+        assert_eq!(interludes[0].start_ms, 0);
+        assert_eq!(interludes[0].end_ms, 5_000);
+        assert!(interludes[1].start_ms > 10_200 && interludes[1].start_ms < 16_000);
+        assert_eq!(interludes[1].end_ms, 22_500);
+        assert_eq!(interludes[2].start_ms, 25_000);
+        assert_eq!(interludes[2].end_ms, 31_000);
+        assert_eq!(interludes[3].start_ms, 34_000);
+        assert_eq!(interludes[3].end_ms, 40_000);
     }
 }

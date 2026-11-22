@@ -1153,6 +1153,17 @@ pub fn save_library_cache_pruned(lib: &Library, data: &UserData) -> io::Result<(
     write_atomic(&library_file(), &serde_json::to_vec(&tracks)?)
 }
 
+pub fn snapshot_pruned_library_cache(lib: &Library, data: &UserData) -> Vec<Track> {
+    select_cached_tracks(lib, data, MAX_UNREFERENCED_YT_CACHE)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+pub fn write_library_cache_tracks(tracks: &[Track]) -> io::Result<()> {
+    write_atomic(&library_file(), &serde_json::to_vec(tracks)?)
+}
+
 fn select_cached_tracks<'a>(lib: &'a Library, data: &UserData, max_unreferenced: usize) -> Vec<&'a Track> {
     let mut keep_ids = std::collections::HashSet::new();
     for entry in &data.liked {

@@ -1,13 +1,15 @@
 //! Cover pictures: read off a worker thread, generated placeholders until they arrive.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
 use lofty::prelude::*;
 
 const SIZE: u32 = 544;
+const ART_WORKERS: usize = 4;
 
 pub use crate::library::cover_key;
 
@@ -18,6 +20,51 @@ struct Decoded {
     colors: Option<[Color32; 4]>,
 }
 
+struct JobQueue {
+    items: Mutex<(VecDeque<(String, String)>, bool)>,
+    wake: Condvar,
+}
+
+impl JobQueue {
+    fn new() -> Self {
+        Self {
+            items: Mutex::new((VecDeque::new(), false)),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn push(&self, job: (String, String), urgent: bool) {
+        if let Ok(mut guard) = self.items.lock() {
+            if urgent {
+                guard.0.push_front(job);
+            } else {
+                guard.0.push_back(job);
+            }
+            self.wake.notify_one();
+        }
+    }
+
+    fn pop(&self) -> Option<(String, String)> {
+        let mut guard = self.items.lock().ok()?;
+        loop {
+            if let Some(job) = guard.0.pop_front() {
+                return Some(job);
+            }
+            if guard.1 {
+                return None;
+            }
+            guard = self.wake.wait(guard).ok()?;
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut guard) = self.items.lock() {
+            guard.1 = true;
+            self.wake.notify_all();
+        }
+    }
+}
+
 pub struct ArtCache {
     textures: HashMap<String, TextureHandle>,
     backdrops: HashMap<String, TextureHandle>,
@@ -26,30 +73,42 @@ pub struct ArtCache {
     placeholder_backdrops: HashMap<String, TextureHandle>,
     requested: HashSet<String>,
     pending: usize,
-    jobs: Sender<(String, String)>,
+    queue: Arc<JobQueue>,
     results: Receiver<Decoded>,
+}
+
+impl Drop for ArtCache {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 impl ArtCache {
     pub fn new(ctx: egui::Context) -> Self {
-        let (jobs, rx) = mpsc::channel::<(String, String)>();
+        let queue = Arc::new(JobQueue::new());
         let (tx, results) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("art".into())
-            .spawn(move || {
-                while let Ok((key, path)) = rx.recv() {
-                    let image = read_cover(&path);
-                    let (backdrop, colors) = match &image {
-                        Some(img) => (Some(spicy_backdrop_image(img)), Some(cover_colors(img))),
-                        None => (None, None),
-                    };
-                    if tx.send(Decoded { key, image, backdrop, colors }).is_err() {
-                        break;
+        // Run 4 parallel cover worker threads so Home/Search shelves decode 4x faster and urgent
+        // currently-playing covers jump to the front of the queue instead of waiting behind 30 thumbnails.
+        for i in 0..ART_WORKERS {
+            let q = queue.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("art-{i}"))
+                .spawn(move || {
+                    while let Some((key, path)) = q.pop() {
+                        let image = read_cover(&path);
+                        let (backdrop, colors) = match &image {
+                            Some(img) => (Some(spicy_backdrop_image(img)), Some(cover_colors(img))),
+                            None => (None, None),
+                        };
+                        if tx.send(Decoded { key, image, backdrop, colors }).is_err() {
+                            break;
+                        }
+                        ctx.request_repaint();
                     }
-                    ctx.request_repaint();
-                }
-            })
-            .expect("art thread");
+                });
+        }
         Self {
             textures: HashMap::new(),
             backdrops: HashMap::new(),
@@ -58,8 +117,15 @@ impl ArtCache {
             placeholder_backdrops: HashMap::new(),
             requested: HashSet::new(),
             pending: 0,
-            jobs,
+            queue,
             results,
+        }
+    }
+
+    fn enqueue(&mut self, key: &str, path: &str, urgent: bool) {
+        if self.requested.insert(key.to_string()) {
+            self.queue.push((key.to_string(), path.to_string()), urgent);
+            self.pending += 1;
         }
     }
 
@@ -106,15 +172,13 @@ impl ArtCache {
         self.pending > 0
     }
 
-    /// Starts decoding/fetching artwork on the background art thread without allocating a placeholder texture.
+    /// Starts decoding/fetching artwork on the background art pool without allocating a placeholder texture.
     pub fn prefetch(&mut self, key: &str, path: Option<&str>) {
         if self.textures.contains_key(key) {
             return;
         }
         if let Some(p) = path {
-            if self.requested.insert(key.to_string()) && self.jobs.send((key.to_string(), p.to_string())).is_ok() {
-                self.pending += 1;
-            }
+            self.enqueue(key, p, false);
         }
     }
 
@@ -124,9 +188,7 @@ impl ArtCache {
             return t.clone();
         }
         if let Some(p) = path {
-            if self.requested.insert(key.to_string()) && self.jobs.send((key.to_string(), p.to_string())).is_ok() {
-                self.pending += 1;
-            }
+            self.enqueue(key, p, false);
         }
         if let Some(t) = self.placeholders.get(key) {
             return t.clone();
@@ -146,6 +208,12 @@ impl ArtCache {
 
     /// Raw blurred album cover; Kawarp and CSS grading run in the GPU paint callback.
     pub fn backdrop_texture(&mut self, ctx: &egui::Context, key: &str, path: Option<&str>) -> TextureHandle {
+        if !self.textures.contains_key(key) {
+            if let Some(p) = path {
+                // Playing track backdrop/cover jumps ahead of queued Home/Search thumbnails.
+                self.enqueue(key, p, true);
+            }
+        }
         let _ = self.get(ctx, key, path);
         if let Some(t) = self.backdrops.get(key) {
             return t.clone();
@@ -376,7 +444,9 @@ fn download(url: &str) -> Option<ColorImage> {
     static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     let client = CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(6))
+            .tcp_nodelay(true)
             .build()
             .expect("art HTTP client")
     });

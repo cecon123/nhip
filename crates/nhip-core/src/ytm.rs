@@ -441,11 +441,80 @@ pub fn stream_http_agent() -> &'static reqwest::blocking::Client {
     static AGENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     AGENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(8))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_nodelay(true)
             .redirect(reqwest::redirect::Policy::limited(3))
             .build()
             .expect("stream HTTP client")
     })
+}
+
+/// Pre-warms YouTube `visitorData` and the HTTPS keep-alive pool in a single background thread at
+/// startup so the very first track click avoids the ~1s cold `visitor_id` round-trip.
+pub fn warm_stream_client() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("ytm-warm".into()).spawn(|| {
+        let already = visitor_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if already {
+            return;
+        }
+        let agent = stream_http_agent();
+        if let Ok(fresh) = fetch_visitor_data(agent) {
+            let mut guard = visitor_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(fresh);
+            }
+        }
+    });
+}
+
+struct AuxYtmSession {
+    runtime: tokio::runtime::Runtime,
+    api: YtMusic<NoAuthToken>,
+}
+
+/// Runs an async `ytmapi_rs` operation using a small pool of cached `(Runtime, YtMusic)` sessions
+/// so `youtube_lyrics` and `related_songs` reuse existing TLS + Innertube sessions instead of
+/// bootstrapping `music.youtube.com` HTML from scratch on every single track.
+fn with_cached_ytm<T, F>(connect_timeout: Duration, f: F) -> Result<T, Error>
+where
+    F: FnOnce(&tokio::runtime::Runtime, &YtMusic<NoAuthToken>) -> Result<T, Error>,
+{
+    static POOL: OnceLock<Mutex<Vec<AuxYtmSession>>> = OnceLock::new();
+    let pool = POOL.get_or_init(Mutex::default);
+    let session = pool.lock().ok().and_then(|mut v| v.pop());
+    let session = match session {
+        Some(s) => s,
+        None => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| Error::Network)?;
+            let api = runtime.block_on(async {
+                tokio::time::timeout(connect_timeout, connect())
+                    .await
+                    .unwrap_or(Err(Error::Network))
+            })?;
+            AuxYtmSession { runtime, api }
+        }
+    };
+    let result = f(&session.runtime, &session.api);
+    if !matches!(&result, Err(Error::Network)) {
+        if let Ok(mut v) = pool.lock() {
+            if v.len() < 3 {
+                v.push(session);
+            }
+        }
+    }
+    result
 }
 
 fn visitor_cache() -> &'static Mutex<Option<String>> {
@@ -784,24 +853,125 @@ pub fn related_songs(video_id: &str) -> Result<Vec<Item>, Error> {
     if !valid_video_id(video_id) {
         return Err(Error::Unavailable);
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| Error::Network)?;
-    runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(12), async {
-            let api = connect().await?;
-            let page = api.query(Radio(video_id)).await?;
-            Ok(page.items)
+    with_cached_ytm(Duration::from_secs(8), |rt, api| {
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let page = api.query(Radio(video_id)).await?;
+                Ok(page.items)
+            })
+            .await
+            .unwrap_or(Err(Error::Network))
         })
-        .await
-        .unwrap_or(Err(Error::Network))
     })
 }
 
 pub fn online_lyrics(track: &crate::library::Track) -> Option<crate::lrc::Lyrics> {
     let cfg = crate::spicy::SpicyApiConfig::from_settings(&crate::library::Settings::default());
     online_lyrics_with_config(track, &cfg)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedOnlineLyrics {
+    saved_at_unix: u64,
+    lyrics: crate::lrc::Lyrics,
+}
+
+const LYRICS_DISK_CACHE_TTL_SECS: u64 = 7 * 86_400;
+const LYRICS_DISK_CACHE_MAX_ENTRIES: usize = 128;
+
+fn lyrics_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn lyrics_cache_key(track: &crate::library::Track) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        track.youtube_id().unwrap_or_default(),
+        track.title,
+        track.artist,
+        track.album,
+        track.duration_ms
+    )
+}
+
+fn lyrics_cache_file() -> std::path::PathBuf {
+    crate::library::data_dir().join("lyrics-cache.json")
+}
+
+fn lyrics_cache_map() -> &'static Mutex<HashMap<String, CachedOnlineLyrics>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedOnlineLyrics>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut map = HashMap::new();
+        if !cfg!(test) {
+            if let Ok(raw) = std::fs::read_to_string(lyrics_cache_file()) {
+                if let Ok(mut parsed) = serde_json::from_str::<HashMap<String, CachedOnlineLyrics>>(&raw) {
+                    let now = lyrics_unix_now();
+                    parsed.retain(|_, e| now.saturating_sub(e.saved_at_unix) <= LYRICS_DISK_CACHE_TTL_SECS);
+                    for entry in parsed.values_mut() {
+                        entry.lyrics.restore_provider_label();
+                    }
+                    map = parsed;
+                }
+            }
+        }
+        Mutex::new(map)
+    })
+}
+
+fn get_cached_online_lyrics(key: &str) -> Option<crate::lrc::Lyrics> {
+    let mut cache = lyrics_cache_map().lock().ok()?;
+    let now = lyrics_unix_now();
+    let valid = cache
+        .get(key)
+        .is_some_and(|e| now.saturating_sub(e.saved_at_unix) <= LYRICS_DISK_CACHE_TTL_SECS);
+    if !valid {
+        cache.remove(key);
+        return None;
+    }
+    let mut lyrics = cache.get(key)?.lyrics.clone();
+    lyrics.restore_provider_label();
+    Some(lyrics)
+}
+
+fn put_cached_online_lyrics(key: String, lyrics: crate::lrc::Lyrics) {
+    let now = lyrics_unix_now();
+    let snapshot = if let Ok(mut cache) = lyrics_cache_map().lock() {
+        cache.retain(|_, e| now.saturating_sub(e.saved_at_unix) <= LYRICS_DISK_CACHE_TTL_SECS);
+        if cache.len() >= LYRICS_DISK_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.saved_at_unix)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(key, CachedOnlineLyrics { saved_at_unix: now, lyrics });
+        (!cfg!(test)).then(|| cache.clone())
+    } else {
+        None
+    };
+    if let Some(map) = snapshot {
+        let _ = std::thread::Builder::new().name("lyrics-cache-save".into()).spawn(move || {
+            let path = lyrics_cache_file();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(bytes) = serde_json::to_vec(&map) {
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+        });
+    }
+}
+
+fn lyrics_has_word_spans(lyrics: &crate::lrc::Lyrics) -> bool {
+    lyrics.synced && lyrics.lines.iter().any(|l| !l.spans.is_empty())
 }
 
 /// Lyrics Provider Manager:
@@ -819,6 +989,181 @@ pub fn online_lyrics_with_config(
         }
     }
     online_lyrics_fallbacks(track)
+}
+
+/// Progressive lyrics loader for interactive UI playback:
+/// - Delivers disk/memory cached lyrics immediately (`< 1 ms`).
+/// - Otherwise races Spicy (when configured), LyricsPlus v2, LRCLIB, and YouTube Music in parallel.
+/// - Calls `on_update` the INSTANT any synced provider responds (typically LRCLIB in ~0.5-1.2s)
+///   so the UI never sits on a loading skeleton for 8 seconds waiting on slow/rate-limited mirrors.
+/// - Seamlessly calls `on_update` a second time if higher-fidelity word-synced lyrics (Spicy or
+///   LyricsPlus syllable spans) arrive shortly afterward.
+pub fn online_lyrics_progressive<F>(
+    track: &crate::library::Track,
+    spicy_config: &crate::spicy::SpicyApiConfig,
+    mut on_update: F,
+) -> Option<crate::lrc::Lyrics>
+where
+    F: FnMut(crate::lrc::Lyrics),
+{
+    let key = lyrics_cache_key(track);
+    if !spicy_config.is_eligible() {
+        if let Some(hit) = get_cached_online_lyrics(&key) {
+            on_update(hit.clone());
+            return Some(hit);
+        }
+    }
+
+    // Source IDs: 3 = Spicy API, 2 = LyricsPlus v2, 1 = YouTube Music, 0 = LRCLIB
+    let (tx, rx) = mpsc::channel::<(u8, Option<crate::lrc::Lyrics>)>();
+    let mut pending_count = 3usize;
+    let mut spicy_done = true;
+
+    if spicy_config.is_eligible() {
+        pending_count += 1;
+        spicy_done = false;
+        let t = track.clone();
+        let cfg = spicy_config.clone();
+        let stx = tx.clone();
+        let _ = std::thread::Builder::new().name("lyrics-spicy".into()).spawn(move || {
+            let res = crate::spicy::fetch_for_track(&t, &cfg)
+                .ok()
+                .filter(|l| !l.lines.is_empty());
+            let _ = stx.send((3, res));
+        });
+    }
+
+    let word_track = track.clone();
+    let word_tx = tx.clone();
+    let _ = std::thread::Builder::new().name("lyrics-word-sync".into()).spawn(move || {
+        let lyrics = crate::lrclib::fetch_word_synced(
+            &word_track.title,
+            &word_track.artist,
+            &word_track.album,
+            word_track.duration_ms,
+        );
+        let _ = word_tx.send((2, lyrics));
+    });
+    let youtube_track = track.clone();
+    let youtube_tx = tx.clone();
+    let _ = std::thread::Builder::new().name("lyrics-youtube".into()).spawn(move || {
+        let _ = youtube_tx.send((1, youtube_lyrics(&youtube_track)));
+    });
+    let lrclib_track = track.clone();
+    let _ = std::thread::Builder::new().name("lyrics-lrclib".into()).spawn(move || {
+        let lyrics = crate::lrclib::fetch(
+            &lrclib_track.title,
+            &lrclib_track.artist,
+            &lrclib_track.album,
+            lrclib_track.duration_ms,
+        )
+        .map(|text| {
+            let mut l = crate::lrc::Lyrics::parse(&text);
+            l.provider = Some("LRCLIB");
+            l.source = Some("lrclib".to_string());
+            l
+        })
+        .filter(|l| !l.lines.is_empty());
+        let _ = tx.send((0, lyrics));
+    });
+
+    let mut deadline = Instant::now() + Duration::from_millis(4_500);
+    let mut spicy_res: Option<crate::lrc::Lyrics> = None;
+    let mut word_synced: Option<crate::lrc::Lyrics> = None;
+    let mut youtube: Option<crate::lrc::Lyrics> = None;
+    let mut lrclib: Option<crate::lrc::Lyrics> = None;
+    let mut lp_done = false;
+    let mut emitted_synced = false;
+    let mut emitted_word_synced = false;
+
+    for _ in 0..pending_count {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let Ok((src, lyrics)) = rx.recv_timeout(rem) else { break };
+        match src {
+            3 => {
+                spicy_res = lyrics;
+                spicy_done = true;
+                if let Some(ref l) = spicy_res {
+                    if !l.lines.is_empty() {
+                        on_update(l.clone());
+                        return Some(l.clone());
+                    }
+                }
+            }
+            2 => {
+                word_synced = lyrics;
+                lp_done = true;
+                if let Some(ref l) = word_synced {
+                    if lyrics_has_word_spans(l) {
+                        emitted_synced = true;
+                        emitted_word_synced = true;
+                        on_update(l.clone());
+                        if spicy_done {
+                            break;
+                        }
+                    } else if l.synced && !emitted_synced {
+                        emitted_synced = true;
+                        on_update(l.clone());
+                        if spicy_done {
+                            break;
+                        }
+                    }
+                }
+            }
+            1 => {
+                youtube = lyrics;
+                if !emitted_synced {
+                    if let Some(ref l) = youtube {
+                        if l.synced {
+                            emitted_synced = true;
+                            on_update(l.clone());
+                            // Give word-synced sources at most 1.5s to upgrade once line-synced is visible.
+                            let upgrade_cap = Instant::now() + Duration::from_millis(1_500);
+                            if upgrade_cap < deadline {
+                                deadline = upgrade_cap;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                lrclib = lyrics;
+                if !emitted_synced {
+                    if let Some(ref l) = lrclib {
+                        if l.synced {
+                            emitted_synced = true;
+                            on_update(l.clone());
+                            let upgrade_cap = Instant::now() + Duration::from_millis(1_500);
+                            if upgrade_cap < deadline {
+                                deadline = upgrade_cap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if spicy_done && lp_done && emitted_synced {
+            break;
+        }
+    }
+
+    let result = if let Some(l) = spicy_res {
+        Some(l)
+    } else if word_synced.as_ref().is_some_and(|l| l.synced) {
+        word_synced
+    } else {
+        choose_lyrics(youtube, lrclib).or(word_synced)
+    };
+    if let Some(ref lyrics) = result {
+        if !emitted_synced && !emitted_word_synced {
+            on_update(lyrics.clone());
+        }
+        put_cached_online_lyrics(key, lyrics.clone());
+    }
+    result
 }
 
 /// Testable provider-order coordinator: tries Spicy Lyrics first when eligible, then invokes `fallback`.
@@ -843,74 +1188,11 @@ where
 }
 
 fn online_lyrics_fallbacks(track: &crate::library::Track) -> Option<crate::lrc::Lyrics> {
-    static CACHE: OnceLock<Mutex<HashMap<String, crate::lrc::Lyrics>>> = OnceLock::new();
-    let key = format!("{}|{}|{}|{}|{}", track.youtube_id().unwrap_or_default(), track.title, track.artist, track.album, track.duration_ms);
-    let cache = CACHE.get_or_init(Mutex::default);
-    if let Some(lyrics) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) { return Some(lyrics); }
-    let (tx, rx) = mpsc::channel::<(u8, Option<crate::lrc::Lyrics>)>();
-    let word_track = track.clone();
-    let word_tx = tx.clone();
-    let _ = std::thread::Builder::new().name("lyrics-word-sync".into()).spawn(move || {
-        let lyrics = crate::lrclib::fetch_word_synced(
-            &word_track.title,
-            &word_track.artist,
-            &word_track.album,
-            word_track.duration_ms,
-        );
-        let _ = word_tx.send((2, lyrics));
-    });
-    let youtube_track = track.clone();
-    let youtube_tx = tx.clone();
-    let _ = std::thread::Builder::new().name("lyrics-youtube".into()).spawn(move || {
-        let _ = youtube_tx.send((1, youtube_lyrics(&youtube_track)));
-    });
-    let lrclib_track = track.clone();
-    let _ = std::thread::Builder::new().name("lyrics-lrclib".into()).spawn(move || {
-        let lyrics = crate::lrclib::fetch(&lrclib_track.title, &lrclib_track.artist, &lrclib_track.album, lrclib_track.duration_ms)
-            .map(|text| {
-                let mut l = crate::lrc::Lyrics::parse(&text);
-                l.provider = Some("LRCLIB");
-                l.source = Some("lrclib".to_string());
-                l
-            })
-            .filter(|l| !l.lines.is_empty());
-        let _ = tx.send((0, lyrics));
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let (mut word_synced, mut youtube, mut lrclib) = (None, None, None);
-    let mut lp_done = false;
-    for _ in 0..3 {
-        let Ok((src, lyrics)) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else { break };
-        match src {
-            2 => {
-                word_synced = lyrics;
-                lp_done = true;
-                // Prioritize LyricsPlus v2: return immediately whenever LyricsPlus succeeds!
-                if word_synced.as_ref().is_some_and(|l| l.synced) {
-                    break;
-                }
-            }
-            1 => youtube = lyrics,
-            _ => lrclib = lyrics,
-        }
-        // Only short-circuit on fallback sources once LyricsPlus v2 has already finished with no match.
-        if lp_done && (youtube.as_ref().is_some_and(|l| l.synced) || lrclib.as_ref().is_some_and(|l| l.synced)) {
-            break;
-        }
-    }
-    let result = if word_synced.as_ref().is_some_and(|l| l.synced) {
-        word_synced
-    } else {
-        choose_lyrics(youtube, lrclib).or(word_synced)
+    let disabled_spicy = crate::spicy::SpicyApiConfig {
+        enabled: false,
+        ..Default::default()
     };
-    if let Some(lyrics) = &result {
-        if let Ok(mut cache) = cache.lock() {
-            if cache.len() >= 64 { if let Some(key) = cache.keys().next().cloned() { cache.remove(&key); } }
-            cache.insert(key, lyrics.clone());
-        }
-    }
-    result
+    online_lyrics_progressive(track, &disabled_spicy, |_| {})
 }
 
 #[cfg(test)]
@@ -930,28 +1212,27 @@ fn collect_lyrics(rx: mpsc::Receiver<(bool, Option<crate::lrc::Lyrics>)>, timeou
 fn youtube_lyrics(track: &crate::library::Track) -> Option<crate::lrc::Lyrics> {
     let mut recording = None;
     let youtube = track.youtube_id().and_then(|id| {
-        let (youtube, details) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()?
-            .block_on(async {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(9);
-                let api = tokio::time::timeout_at(deadline, connect())
-                    .await
-                    .ok()?
-                    .ok()?;
-                let (youtube, details) = futures_util::future::join(
-                    tokio::time::timeout_at(deadline, lyrics(&api, id)),
-                    tokio::time::timeout_at(deadline, async {
-                        if track.duration_ms > 0 && !track.artist.is_empty() {
-                            return None;
-                        }
-                        watch_song(&api, id).await
-                    }),
-                )
-                .await;
-                Some((youtube.ok().flatten(), details.ok().flatten()))
-            })?;
+        let need_watch = track.duration_ms == 0 || track.artist.is_empty();
+        let (youtube, details) = with_cached_ytm(Duration::from_secs(5), |rt, api| {
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (youtube, details) = futures_util::future::join(
+                        lyrics(api, id),
+                        async {
+                            if !need_watch {
+                                return None;
+                            }
+                            watch_song(api, id).await
+                        },
+                    )
+                    .await;
+                    Ok((youtube, details))
+                })
+                .await
+                .unwrap_or(Err(Error::Network))
+            })
+        })
+        .ok()?;
         recording = details;
         youtube
     });

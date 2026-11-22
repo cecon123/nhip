@@ -175,12 +175,37 @@ fn build_shape(
 
 type TargetSlot = (glow::Texture, glow::Framebuffer, [i32; 2], u64);
 
+struct WarpLocs {
+    texture: Option<glow::UniformLocation>,
+    time: Option<glow::UniformLocation>,
+    intensity: Option<glow::UniformLocation>,
+}
+
+struct OutputLocs {
+    texture: Option<glow::UniformLocation>,
+    time: Option<glow::UniformLocation>,
+    saturation: Option<glow::UniformLocation>,
+    dithering: Option<glow::UniformLocation>,
+    scale: Option<glow::UniformLocation>,
+    alpha: Option<glow::UniformLocation>,
+    sidebar: Option<glow::UniformLocation>,
+    frost: Option<glow::UniformLocation>,
+    tint: Option<glow::UniformLocation>,
+    uv_rect: Option<glow::UniformLocation>,
+    radius: Option<glow::UniformLocation>,
+    header_fade: Option<glow::UniformLocation>,
+    resolution: Option<glow::UniformLocation>,
+}
+
 struct Renderer {
     gl: Weak<glow::Context>,
     warp: glow::Program,
     output: glow::Program,
+    warp_locs: WarpLocs,
+    output_locs: OutputLocs,
     vao: glow::VertexArray,
     targets: [Option<TargetSlot>; 4],
+    last_warp: Option<(glow::Texture, u32)>,
     tick: u64,
 }
 
@@ -196,8 +221,25 @@ impl Drop for Renderer {
                 gl: std::mem::replace(&mut self.gl, Weak::new()),
                 warp: self.warp,
                 output: self.output,
+                warp_locs: WarpLocs { texture: None, time: None, intensity: None },
+                output_locs: OutputLocs {
+                    texture: None,
+                    time: None,
+                    saturation: None,
+                    dithering: None,
+                    scale: None,
+                    alpha: None,
+                    sidebar: None,
+                    frost: None,
+                    tint: None,
+                    uv_rect: None,
+                    radius: None,
+                    header_fade: None,
+                    resolution: None,
+                },
                 vao: self.vao,
                 targets: std::mem::take(&mut self.targets),
+                last_warp: None,
                 tick: 0,
             }));
         }
@@ -244,7 +286,37 @@ impl Renderer {
                 Ok(vao) => vao,
                 Err(error) => { gl.delete_program(warp); gl.delete_program(output); return Err(error); }
             };
-            Ok(Self { gl: Arc::downgrade(gl), warp, output, vao, targets: [None, None, None, None], tick: 0 })
+            let warp_locs = WarpLocs {
+                texture: gl.get_uniform_location(warp, "u_texture"),
+                time: gl.get_uniform_location(warp, "u_time"),
+                intensity: gl.get_uniform_location(warp, "u_intensity"),
+            };
+            let output_locs = OutputLocs {
+                texture: gl.get_uniform_location(output, "u_texture"),
+                time: gl.get_uniform_location(output, "u_time"),
+                saturation: gl.get_uniform_location(output, "u_saturation"),
+                dithering: gl.get_uniform_location(output, "u_dithering"),
+                scale: gl.get_uniform_location(output, "u_scale"),
+                alpha: gl.get_uniform_location(output, "u_alpha"),
+                sidebar: gl.get_uniform_location(output, "u_sidebar"),
+                frost: gl.get_uniform_location(output, "u_frost"),
+                tint: gl.get_uniform_location(output, "u_tint"),
+                uv_rect: gl.get_uniform_location(output, "u_uv_rect"),
+                radius: gl.get_uniform_location(output, "u_radius"),
+                header_fade: gl.get_uniform_location(output, "u_header_fade"),
+                resolution: gl.get_uniform_location(output, "u_resolution"),
+            };
+            Ok(Self {
+                gl: Arc::downgrade(gl),
+                warp,
+                output,
+                warp_locs,
+                output_locs,
+                vao,
+                targets: [None, None, None, None],
+                last_warp: None,
+                tick: 0,
+            })
         }
     }
 
@@ -271,22 +343,13 @@ impl Renderer {
             gl.active_texture(glow::TEXTURE0);
             self.tick = self.tick.wrapping_add(1);
             let tick = self.tick;
-            // For frosted glass cards, render the low-frequency warp pass at a compact fixed resolution
-            // (256x256) so all GlassCards share ONE cached FBO slot with zero FBO churn on resize/scroll.
-            let warp_size = if frost_uv > 0.0001 { [256, 256] } else { size };
-            let slot_idx = if let Some(idx) = self.targets.iter().position(|t| t.as_ref().is_some_and(|e| e.2 == warp_size)) {
-                idx
-            } else if let Some(idx) = self.targets.iter().position(|t| t.is_none()) {
-                idx
-            } else {
-                self.targets
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, t)| t.as_ref().map(|e| e.3).unwrap_or(0))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            };
-            let target = &mut self.targets[slot_idx];
+            // The input cover bokeh texture is 64x64 low-frequency color clouds, so running the
+            // 4-octave simplex warp at 256x256 RGBA8 (instead of full-window RGBA16F) produces
+            // identical creamy gradients at 16x-36x lower GPU fill cost AND lets the sidebar
+            // backdrop + all GlassCards share ONE cached warp pass per (source, phase).
+            let warp_size = [256, 256];
+            let target = &mut self.targets[0];
+            let mut allocated = false;
             if target.as_ref().is_none_or(|target| target.2 != warp_size) {
                 let texture = gl.create_texture()?;
                 let framebuffer = match gl.create_framebuffer() {
@@ -298,64 +361,65 @@ impl Renderer {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
                 gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
                 gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA16F as i32, warp_size[0], warp_size[1], 0, glow::RGBA, glow::HALF_FLOAT, glow::PixelUnpackData::Slice(None));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, warp_size[0], warp_size[1], 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
                 gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
                 if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
                     gl.delete_framebuffer(framebuffer);
                     gl.delete_texture(texture);
-                    return Err("RGBA16F warp framebuffer is incomplete".into());
+                    return Err("RGBA8 warp framebuffer is incomplete".into());
                 }
                 if let Some((old_texture, old_framebuffer, _, _)) = target.replace((texture, framebuffer, warp_size, tick)) {
                     gl.delete_framebuffer(old_framebuffer);
                     gl.delete_texture(old_texture);
                 }
+                allocated = true;
             } else if let Some(entry) = target.as_mut() {
                 entry.3 = tick;
             }
             let Some((texture, framebuffer, _, _)) = *target else { return Ok(()) };
             gl.bind_vertex_array(Some(self.vao));
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::BLEND);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-            gl.viewport(0, 0, warp_size[0], warp_size[1]);
-            gl.use_program(Some(self.warp));
-            gl.bind_texture(glow::TEXTURE_2D, Some(source));
-            gl.uniform_1_i32(gl.get_uniform_location(self.warp, "u_texture").as_ref(), 0);
-            gl.uniform_1_f32(gl.get_uniform_location(self.warp, "u_time").as_ref(), phase);
-            gl.uniform_1_f32(gl.get_uniform_location(self.warp, "u_intensity").as_ref(), 1.0);
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            let warp_key = (source, phase.to_bits());
+            if allocated || self.last_warp != Some(warp_key) {
+                gl.disable(glow::SCISSOR_TEST);
+                gl.disable(glow::BLEND);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                gl.viewport(0, 0, warp_size[0], warp_size[1]);
+                gl.use_program(Some(self.warp));
+                gl.bind_texture(glow::TEXTURE_2D, Some(source));
+                gl.uniform_1_i32(self.warp_locs.texture.as_ref(), 0);
+                gl.uniform_1_f32(self.warp_locs.time.as_ref(), phase);
+                gl.uniform_1_f32(self.warp_locs.intensity.as_ref(), 1.0);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                self.last_warp = Some(warp_key);
+            }
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
             gl.viewport(saved.viewport[0], saved.viewport[1], size[0], size[1]);
-            if saved.scissor { gl.enable(glow::SCISSOR_TEST); }
-            if saved.blend { gl.enable(glow::BLEND); }
+            if saved.scissor { gl.enable(glow::SCISSOR_TEST); } else { gl.disable(glow::SCISSOR_TEST); }
+            if saved.blend { gl.enable(glow::BLEND); } else { gl.disable(glow::BLEND); }
             gl.use_program(Some(self.output));
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            gl.uniform_1_i32(gl.get_uniform_location(self.output, "u_texture").as_ref(), 0);
-            for (name, value) in [
-                ("u_time", phase),
-                ("u_saturation", 1.5),
-                ("u_dithering", 0.008),
-                ("u_scale", 1.0),
-                ("u_alpha", alpha),
-                ("u_sidebar", if sidebar { 1.0 } else { 0.0 }),
-                ("u_frost", frost_uv),
-                ("u_tint", tint),
-            ] {
-                gl.uniform_1_f32(gl.get_uniform_location(self.output, name).as_ref(), value);
-            }
+            gl.uniform_1_i32(self.output_locs.texture.as_ref(), 0);
+            gl.uniform_1_f32(self.output_locs.time.as_ref(), phase);
+            gl.uniform_1_f32(self.output_locs.saturation.as_ref(), 1.5);
+            gl.uniform_1_f32(self.output_locs.dithering.as_ref(), 0.008);
+            gl.uniform_1_f32(self.output_locs.scale.as_ref(), 1.0);
+            gl.uniform_1_f32(self.output_locs.alpha.as_ref(), alpha);
+            gl.uniform_1_f32(self.output_locs.sidebar.as_ref(), if sidebar { 1.0 } else { 0.0 });
+            gl.uniform_1_f32(self.output_locs.frost.as_ref(), frost_uv);
+            gl.uniform_1_f32(self.output_locs.tint.as_ref(), tint);
             gl.uniform_4_f32(
-                gl.get_uniform_location(self.output, "u_uv_rect").as_ref(),
+                self.output_locs.uv_rect.as_ref(),
                 uv_rect[0],
                 uv_rect[1],
                 uv_rect[2],
                 uv_rect[3],
             );
             let fade = header_fade.unwrap_or([-2.0, -1.0]);
-            gl.uniform_1_f32(gl.get_uniform_location(self.output, "u_radius").as_ref(), radius);
-            gl.uniform_2_f32(gl.get_uniform_location(self.output, "u_header_fade").as_ref(), fade[0], fade[1]);
-            gl.uniform_2_f32(gl.get_uniform_location(self.output, "u_resolution").as_ref(), size[0] as f32, size[1] as f32);
+            gl.uniform_1_f32(self.output_locs.radius.as_ref(), radius);
+            gl.uniform_2_f32(self.output_locs.header_fade.as_ref(), fade[0], fade[1]);
+            gl.uniform_2_f32(self.output_locs.resolution.as_ref(), size[0] as f32, size[1] as f32);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
         }
         Ok(())

@@ -10,7 +10,7 @@ serde_json = "1"
 
 [package]
 name = "nhip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A desktop music player written in Rust"
 
